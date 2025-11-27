@@ -1,0 +1,42 @@
+# Boltz configuration
+seed: 68
+recycling_steps: 1 # Optimized: reduced from 3 to 1 for faster inference
+diffusion_samples: 1
+sampling_steps: 50 # Optimized: reduced from 100 to 50 for faster inference
+sampling_steps_affinity: 100
+diffusion_samples_affinity: 3
+affinity_mw_correction: true
+output_format: "pdb"
+override: true
+no_kernels: true
+remove_files: true # Remove files after processing
+
+batch_predictions: true
+
+# DataLoader optimization - CRITICAL for performance
+# With batch_size=1 (mandatory for structure prediction), we MUST process many molecules in parallel via workers
+# This prevents GPU from being idle 99% of the time waiting for DataLoader
+# NOTE: Reduced to 0 to avoid shared memory (shm) bus errors
+# Setting to 0 uses main process only, avoiding multiprocessing shared memory issues
+# For better performance with sufficient /dev/shm, can increase to 2-4 workers
+# num_workers: 0 # Set to 0 to avoid shared memory bus errors (increase to 2-4 if /dev/shm is large enough)
+
+# Precomputed conformers optimization (LARGEST WIN - saves CPU time)
+# Precompute conformers in parallel before inference to skip expensive RDKit embedding
+# Each worker uses ~100-200MB RAM for conformer generation
+# 40 workers = ~4-8GB RAM, leaving headroom for DataLoader workers and system
+use_precomputed_conformers: true # Enable precomputation (recommended)
+precompute_workers: 32 # Safe for 56-core system: balances speed with memory (max 48 if RAM allows)
+# precompute_shard_size: 1000 # Number of records per shard file
+
+# Memory safety settings
+num_workers: 4
+max_gpu_memory_usage: 0.90 # Maximum GPU memory usage before reducing batch size (90% of VRAM)
+max_ram_usage: 0.85 # Maximum system RAM usage before reducing workers (85% of RAM)
+enable_memory_monitoring: true # Enable memory monitoring and adaptive adjustments
+
+# Model quantization (for faster inference)
+# Options: "none", "fp16", "int8"
+# FP16: ~2x faster, minimal accuracy loss (recommended)
+# INT8: ~4x faster, some accuracy loss (experimental)
+quantization: "fp16"

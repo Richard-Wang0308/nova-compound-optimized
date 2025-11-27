@@ -1,0 +1,64 @@
+# Cache configuration for multi-GPU single miner
+
+# Tier 1: Permanent caches
+permanent_cache:
+  smiles_cache_size: 100000 # Per-GPU local cache
+  smiles_cache_dir: "./cache"
+  descriptor_cache_size: 50000
+
+# Tier 2: Weekly target cache
+weekly_cache:
+  max_score_cache_size: 1000000
+  preload_sample_size: 2000
+
+# Tier 3: Epoch antitarget cache
+epoch_cache:
+  max_score_cache_size: 500000
+  epoch_duration_minutes: 72
+
+# Shared memory cache (multi-GPU coordination)
+shared_memory_cache:
+  enabled: true
+  max_size: 200000 # Shared across all GPUs
+
+  # Cache sizes
+  smiles_cache_size: 200000
+  target_score_cache_size: 1000000
+  antitarget_score_cache_size: 500000
+
+# Multi-GPU settings
+multi_gpu:
+  enabled: true
+  auto_detect_gpus: true # Automatically use all available GPUs
+  gpu_ids: [0, 1] # Or specify manually
+
+  # Per-GPU settings
+  molecules_per_gpu: 100
+  boltz_batch_size: 50
+
+  # Load balancing
+  dynamic_load_balancing: true # Adjust load based on GPU performance
+
+# Molecular generation
+generation:
+  batch_size: 400
+  elite_fraction: 0.25
+  mutation_probability: 0.1
+  samples_per_reaction: 150
+
+# Pre-filtering thresholds
+prefilter:
+  min_rotatable_bonds: 0
+  max_rotatable_bonds: 10
+  min_heavy_atoms: 10
+  max_molecular_weight: 550.0
+  max_tpsa: 140.0
+
+# Performance tuning
+performance:
+  molecule_gen_workers: 4
+  cache_save_interval: 300
+
+  # Memory management
+  aggressive_gc: true # Aggressive garbage collection
+  gc_interval: 10 # Run GC every N iterations
