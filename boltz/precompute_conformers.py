@@ -4,22 +4,20 @@ This avoids expensive RDKit conformer generation during inference.
 """
 import os
 import sys
-import torch
+import pickle
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
-import numpy as np
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(BASE_DIR)
 
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import AllChem
 import bittensor as bt
 
 
-def compute_conformer_fast(smiles: str, max_attempts: int = 5, max_iters: int = 500) -> Optional[Dict]:
+def compute_conformer_fast(smiles: str, max_attempts: int = 5, max_iters: int = 500) -> Optional[Chem.Mol]:
     """
     Compute conformer for a single SMILES string with fast settings.
     
@@ -29,7 +27,7 @@ def compute_conformer_fast(smiles: str, max_attempts: int = 5, max_iters: int = 
         max_iters: Maximum UFF optimization iterations (reduced for speed)
     
     Returns:
-        Dict with coords, atom_types, bonds, and metadata, or None if failed
+        RDKit Mol object with 3D conformer and atom names, or None if failed
     """
     try:
         # Parse SMILES
@@ -69,33 +67,10 @@ def compute_conformer_fast(smiles: str, max_attempts: int = 5, max_iters: int = 
             # Force field issues - use conformer as-is
             pass
         
-        # Extract conformer data
-        conformer = mol.GetConformer(conf_id)
-        num_atoms = mol.GetNumAtoms()
+        # Store SMILES as property for reference
+        mol.SetProp("_SMILES", smiles)
         
-        # Get coordinates
-        coords = np.array([conformer.GetAtomPosition(i) for i in range(num_atoms)], dtype=np.float32)
-        
-        # Get atom types (atomic numbers)
-        atom_types = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int32)
-        
-        # Get bonds (adjacency list)
-        bonds = []
-        for bond in mol.GetBonds():
-            bonds.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), int(bond.GetBondType())))
-        
-        # Get molecular weight (for affinity correction)
-        mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
-        mw = Descriptors.MolWt(mol_no_h)
-        
-        return {
-            "coords": coords,
-            "atom_types": atom_types,
-            "bonds": bonds,
-            "smiles": smiles,
-            "mw": mw,
-            "num_atoms": num_atoms,
-        }
+        return mol
     
     except Exception as e:
         bt.logging.debug(f"Failed to compute conformer for {smiles}: {e}")
@@ -106,7 +81,6 @@ def precompute_conformers_batch(
     items: List[Tuple[str, str]],  # List of (product_name, smiles)
     output_dir: Path,
     max_workers: int = 32,
-    shard_size: int = 1000,
     chunk_size: int = 100,
 ) -> Dict[str, int]:
     """
@@ -116,20 +90,15 @@ def precompute_conformers_batch(
         items: List of (product_name, smiles) tuples
         output_dir: Directory to save precomputed conformers
         max_workers: Number of parallel workers
-        shard_size: Number of records per shard file
         chunk_size: Chunk size for ProcessPoolExecutor
     
     Returns:
-        Dict with stats: {"success": count, "failed": count, "shards": count}
+        Dict with stats: {"success": count, "failed": count}
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create index mapping product_name -> shard_id, offset
-    index = {}
-    shard_id = 0
-    shard_records = []
-    stats = {"success": 0, "failed": 0, "shards": 0}
+    stats = {"success": 0, "failed": 0}
     
     bt.logging.info(f"Precomputing conformers for {len(items)} molecules with {max_workers} workers...")
     
@@ -145,23 +114,22 @@ def precompute_conformers_batch(
         for future in as_completed(future_to_item):
             name, smiles = future_to_item[future]
             try:
-                result = future.result()
+                mol = future.result()
                 
-                if result is not None:
-                    # Add metadata
-                    result["product_name"] = name
-                    shard_records.append(result)
-                    index[name] = (shard_id, len(shard_records) - 1)
+                if mol is not None:
+                    # Save as individual .pkl file (Boltz-2 format)
+                    output_path = output_dir / f"{name}.pkl"
+                    
+                    # Ensure all properties are saved
+                    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+                    
+                    with open(output_path, 'wb') as f:
+                        pickle.dump(mol, f)
+                    
                     stats["success"] += 1
                     
-                    # Write shard when full
-                    if len(shard_records) >= shard_size:
-                        shard_path = output_dir / f"shard_{shard_id:04d}.pt"
-                        torch.save(shard_records, shard_path)
-                        bt.logging.debug(f"Wrote shard {shard_id} with {len(shard_records)} records")
-                        stats["shards"] += 1
-                        shard_records = []
-                        shard_id += 1
+                    if stats["success"] % 100 == 0:
+                        bt.logging.info(f"Processed {stats['success']}/{len(items)} molecules...")
                 else:
                     stats["failed"] += 1
                     
@@ -169,63 +137,170 @@ def precompute_conformers_batch(
                 bt.logging.warning(f"Error processing {name}: {e}")
                 stats["failed"] += 1
     
-    # Write final shard if any remaining records
-    if shard_records:
-        shard_path = output_dir / f"shard_{shard_id:04d}.pt"
-        torch.save(shard_records, shard_path)
-        bt.logging.debug(f"Wrote final shard {shard_id} with {len(shard_records)} records")
-        stats["shards"] += 1
-    
-    # Save index
-    index_path = output_dir / "index.pt"
-    torch.save(index, index_path)
-    
     bt.logging.info(
-        f"Precomputation complete: {stats['success']} success, {stats['failed']} failed, "
-        f"{stats['shards']} shards written"
+        f"Precomputation complete: {stats['success']} success, {stats['failed']} failed"
     )
     
     return stats
 
 
-def load_precomputed_conformer(product_name: str, precomputed_dir: Path) -> Optional[Dict]:
+def load_precomputed_conformer(product_name: str, precomputed_dir: Path) -> Optional[Chem.Mol]:
     """
-    Load a precomputed conformer from shards.
+    Load a precomputed conformer from .pkl file.
     
     Args:
         product_name: Name of the product/molecule
-        precomputed_dir: Directory containing precomputed shards
+        precomputed_dir: Directory containing precomputed conformers
     
     Returns:
-        Dict with conformer data or None if not found
+        RDKit Mol object with conformer or None if not found
     """
     precomputed_dir = Path(precomputed_dir)
-    index_path = precomputed_dir / "index.pt"
+    conformer_path = precomputed_dir / f"{product_name}.pkl"
     
-    if not index_path.exists():
+    if not conformer_path.exists():
         return None
     
     try:
-        # Load index
-        index = torch.load(index_path)
+        with open(conformer_path, 'rb') as f:
+            mol = pickle.load(f)
         
-        if product_name not in index:
-            return None
+        # Verify atom names are present (defensive check)
+        for idx, atom in enumerate(mol.GetAtoms()):
+            if not atom.HasProp("name"):
+                atom_name = f"{atom.GetSymbol()}{idx + 1}"
+                atom.SetProp("name", atom_name)
         
-        shard_id, offset = index[product_name]
-        
-        # Load shard
-        shard_path = precomputed_dir / f"shard_{shard_id:04d}.pt"
-        if not shard_path.exists():
-            return None
-        
-        shard = torch.load(shard_path)
-        if offset >= len(shard):
-            return None
-        
-        return shard[offset]
+        return mol
     
     except Exception as e:
         bt.logging.debug(f"Error loading precomputed conformer for {product_name}: {e}")
         return None
 
+
+# Utility function for batch checking
+def check_precomputed_conformers(
+    product_names: List[str],
+    precomputed_dir: Path
+) -> Tuple[List[str], List[str]]:
+    """
+    Check which conformers are already precomputed.
+    
+    Args:
+        product_names: List of product names to check
+        precomputed_dir: Directory containing precomputed conformers
+    
+    Returns:
+        Tuple of (existing, missing) product names
+    """
+    precomputed_dir = Path(precomputed_dir)
+    existing = []
+    missing = []
+    
+    for name in product_names:
+        conformer_path = precomputed_dir / f"{name}.pkl"
+        if conformer_path.exists():
+            existing.append(name)
+        else:
+            missing.append(name)
+    
+    return existing, missing
+
+
+# Utility function for cleaning up
+def cleanup_precomputed_conformers(
+    precomputed_dir: Path,
+    keep_names: Optional[List[str]] = None,
+    dry_run: bool = True
+) -> Dict[str, int]:
+    """
+    Clean up precomputed conformers directory.
+    
+    Args:
+        precomputed_dir: Directory containing precomputed conformers
+        keep_names: List of product names to keep (None = keep all)
+        dry_run: If True, only report what would be deleted
+    
+    Returns:
+        Dict with stats: {"kept": count, "deleted": count, "total": count}
+    """
+    precomputed_dir = Path(precomputed_dir)
+    
+    if not precomputed_dir.exists():
+        return {"kept": 0, "deleted": 0, "total": 0}
+    
+    stats = {"kept": 0, "deleted": 0, "total": 0}
+    keep_set = set(keep_names) if keep_names else None
+    
+    for pkl_file in precomputed_dir.glob("*.pkl"):
+        stats["total"] += 1
+        name = pkl_file.stem
+        
+        if keep_set is None or name in keep_set:
+            stats["kept"] += 1
+        else:
+            stats["deleted"] += 1
+            if not dry_run:
+                pkl_file.unlink()
+                bt.logging.debug(f"Deleted: {pkl_file.name}")
+    
+    if dry_run:
+        bt.logging.info(
+            f"Dry run: would keep {stats['kept']}/{stats['total']} files, "
+            f"delete {stats['deleted']} files"
+        )
+    else:
+        bt.logging.info(
+            f"Cleanup complete: kept {stats['kept']}/{stats['total']} files, "
+            f"deleted {stats['deleted']} files"
+        )
+    
+    return stats
+
+
+if __name__ == "__main__":
+    """
+    Example usage for testing.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Precompute conformers for Boltz-2")
+    parser.add_argument("--smiles", type=str, help="Single SMILES string to test")
+    parser.add_argument("--output-dir", type=str, default="./test_conformers", help="Output directory")
+    args = parser.parse_args()
+    
+    if args.smiles:
+        # Test single molecule
+        print(f"Testing conformer generation for: {args.smiles}")
+        mol = compute_conformer_fast(args.smiles)
+        
+        if mol is not None:
+            print(f"✓ Success! Generated conformer with {mol.GetNumAtoms()} atoms")
+            
+            # Check atom names
+            print("\nAtom names:")
+            for atom in mol.GetAtoms():
+                if atom.HasProp("name"):
+                    print(f"  {atom.GetSymbol()} -> {atom.GetProp('name')}")
+            
+            # Save to file
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / "test_molecule.pkl"
+            
+            Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+            with open(output_path, 'wb') as f:
+                pickle.dump(mol, f)
+            
+            print(f"\n✓ Saved to: {output_path}")
+            
+            # Test loading
+            loaded_mol = load_precomputed_conformer("test_molecule", output_dir)
+            if loaded_mol:
+                print(f"✓ Successfully loaded conformer")
+            else:
+                print(f"✗ Failed to load conformer")
+        else:
+            print(f"✗ Failed to generate conformer")
+    else:
+        print("Usage: python precompute_conformers.py --smiles 'CCO' --output-dir ./test")

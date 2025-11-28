@@ -294,7 +294,28 @@ class AdaptiveEliteSelector:
         slope = np.polyfit(x, y, 1)[0]
         
         # Normalize by score range (not average)
-        score_range = np.max(y) - np.min(y)
+        y = np.array(y, dtype=np.float64)
+    
+        # Replace NaN with -inf (worst score)
+        y = np.nan_to_num(y, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+        
+        # Filter out infinite values for statistics
+        valid_scores = y[np.isfinite(y)]
+        
+        if len(valid_scores) == 0:
+            # No valid scores - return zeros
+            bt.logging.warning("No valid scores to normalize, returning zeros")
+            return np.zeros_like(y)
+        
+        if len(valid_scores) == 1:
+            # Only one valid score - return 1.0 for valid, 0.0 for invalid
+            normalized = np.where(np.isfinite(y), 1.0, 0.0)
+            return normalized
+        
+        # Calculate range from valid scores only
+        score_min = np.min(valid_scores)
+        score_max = np.max(valid_scores)
+        score_range = score_max - score_min
         if score_range > 1e-10:
             normalized_slope = slope / score_range
         else:

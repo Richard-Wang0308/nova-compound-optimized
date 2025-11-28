@@ -683,6 +683,7 @@ def process_inputs(
             click.echo("All inputs are already processed.")
             updated_manifest = Manifest(existing)
             updated_manifest.dump(out_dir / "processed" / "manifest.json")
+            return updated_manifest
 
     # Create output directories
     msa_dir = out_dir / "msa"
@@ -750,7 +751,7 @@ def process_inputs(
     records = [Record.load(p) for p in records_dir.glob("*.json")]
     manifest = Manifest(records)
     manifest.dump(out_dir / "processed" / "manifest.json")
-
+    return manifest
 
 def _set_kernel_determinism():
     torch.use_deterministic_algorithms(True, warn_only=False)
@@ -881,7 +882,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
-    out_dir = out_dir / f"boltz_results_{data.stem}"
+    out_dir = out_dir / "boltz_results_inputs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Download necessary data and model

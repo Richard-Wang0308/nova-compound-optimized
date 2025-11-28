@@ -858,7 +858,17 @@ def parse_polymer(
         ref_conformer = get_conformer(ref_mol)
 
         # Only use reference atoms set in constants
-        ref_name_to_atom = {a.GetProp("name"): a for a in ref_mol.GetAtoms()}
+        # ref_name_to_atom = {a.GetProp("name"): a for a in ref_mol.GetAtoms()}
+        # AFTER (safe)
+        ref_name_to_atom = {}
+        for idx, atom in enumerate(ref_mol.GetAtoms()):
+            if atom.HasProp("name"):
+                atom_name = atom.GetProp("name")
+            else:
+                # Generate name if missing
+                atom_name = f"{atom.GetSymbol()}{idx + 1}"
+                atom.SetProp("name", atom_name)
+            ref_name_to_atom[atom_name] = atom
         ref_atoms = [ref_name_to_atom[a] for a in const.ref_atoms[res_corrected]]
 
         # Iterate, always in the same order

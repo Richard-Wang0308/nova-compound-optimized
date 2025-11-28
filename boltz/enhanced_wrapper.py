@@ -548,18 +548,67 @@ class EnhancedBoltzWrapper:
                     items_for_precompute,
                     Path(self.precomputed_dir),
                     max_workers=self.config.get('precompute_workers', 32),
-                    shard_size=self.config.get('precompute_shard_size', 1000),
+                    # shard_size=self.config.get('precompute_shard_size', 1000),
                 )
                 bt.logging.info(f"Precomputation stats: {stats}")
         
-        # Write YAML files
+        # ═══════════════════════════════════════════════════════════
+        # ✅ FIXED: Write YAML files with validation
+        # ═══════════════════════════════════════════════════════════
+        bt.logging.info(f"Creating YAML files in {self.input_dir}...")
+        
+        created_files = 0
+        failed_files = 0
+        
         for smiles, ids in self.unique_molecules.items():
-            yaml_content = self.create_yaml_content(smiles)
-            with open(os.path.join(self.input_dir, f"{ids[0][1]}.yaml"), "w") as f:
-                f.write(yaml_content)
+            mol_idx = ids[0][1]  # Get the mol_idx
+            yaml_path = os.path.join(self.input_dir, f"{mol_idx}.yaml")
+            
+            try:
+                # Create YAML content
+                yaml_content = self.create_yaml_content(smiles)
+                
+                # Write file
+                with open(yaml_path, "w") as f:
+                    f.write(yaml_content)
+                
+                # Validate file was created
+                if not os.path.exists(yaml_path):
+                    bt.logging.error(f"❌ Failed to create YAML file: {yaml_path}")
+                    failed_files += 1
+                    continue
+                
+                # Validate file has content
+                file_size = os.path.getsize(yaml_path)
+                if file_size == 0:
+                    bt.logging.error(f"❌ YAML file is empty: {yaml_path}")
+                    failed_files += 1
+                    continue
+                
+                created_files += 1
+                
+            except Exception as e:
+                bt.logging.error(f"❌ Error creating YAML file {yaml_path}: {e}")
+                bt.logging.error(traceback.format_exc())
+                failed_files += 1
+        
+        bt.logging.info(
+            f"✓ Created {created_files}/{len(self.unique_molecules)} YAML files "
+            f"({failed_files} failed)"
+        )
+        
+        if created_files == 0:
+            raise RuntimeError("Failed to create any YAML files!")
+        
+        # Debug: Show sample file
+        if created_files > 0:
+            sample_files = list(Path(self.input_dir).glob("*.yaml"))[:3]
+            bt.logging.debug(f"Sample YAML files created:")
+            for f in sample_files:
+                bt.logging.debug(f"  {f} ({os.path.getsize(f)} bytes)")
         
         bt.logging.debug("Preprocessing complete")
-    
+
     def create_yaml_content(self, ligand_smiles: str) -> str:
         """Create YAML content for Boltz2 prediction."""
         yaml_content = f"""version: 1
@@ -611,10 +660,17 @@ properties:
             final_block_hash: Block hash for determinism
             subnet_config: Subnet configuration
         """
+        import shutil
+        from pathlib import Path
+        from boltz.main import process_inputs
+        from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
+        from pytorch_lightning import Trainer
+        from boltz.data.write.writer import BoltzWriter
+        
         # Store subnet config
         self.subnet_config = subnet_config
         
-        # Preprocess data (same as original)
+        # Preprocess data (creates YAML files)
         self.preprocess_data_for_boltz(
             valid_molecules_by_uid,
             score_dict,
@@ -629,230 +685,139 @@ properties:
         structure_model, affinity_model = self._load_models_if_needed()
         
         # ═══════════════════════════════════════════════════════════
-        # NEW: Batch the prediction calls
+        # ✅ FIXED: Clean up existing processed data to force reprocessing
         # ═══════════════════════════════════════════════════════════
-        all_input_files = []
-        for smiles, id_list in self.unique_molecules.items():
-            mol_idx = id_list[0][1]
-            yaml_path = os.path.join(self.input_dir, f"{mol_idx}.yaml")
-            all_input_files.append((mol_idx, yaml_path))
+        boltz_output_dir = Path(self.output_dir) / "boltz_results_inputs"
         
-        # Split into batches
-        batches = self.optimization_manager.prepare_batch(all_input_files)
+        # Remove existing processed directory
+        processed_dir = boltz_output_dir / "processed"
+        if processed_dir.exists():
+            bt.logging.debug(f"Removing existing processed directory: {processed_dir}")
+            shutil.rmtree(processed_dir)
         
-        bt.logging.info(
-            f"Running Boltz-2 on {len(all_input_files)} molecules in {len(batches)} batches "
-            f"(batch_size={self.optimization_manager.current_batch_size})"
-        )
+        # Remove existing predictions directory
+        predictions_dir = boltz_output_dir / "predictions"
+        if predictions_dir.exists():
+            bt.logging.debug(f"Removing existing predictions directory: {predictions_dir}")
+            shutil.rmtree(predictions_dir)
         
-        total_start_time = time.time()
+        # ═══════════════════════════════════════════════════════════
+        # ✅ Process all YAML files using Boltz-2's process_inputs()
+        # ═══════════════════════════════════════════════════════════
+        bt.logging.info(f"Processing {len(self.unique_molecules)} YAML files...")
         
-        # Process each batch
-        for batch_idx, batch in enumerate(batches, 1):
-            batch_start_time = time.time()
-            
-            bt.logging.info(
-                f"Processing batch {batch_idx}/{len(batches)} ({len(batch)} molecules)"
+        # Get all YAML paths
+        yaml_files = [
+            Path(self.input_dir) / f"{id_list[0][1]}.yaml"
+            for id_list in self.unique_molecules.values()
+        ]
+        
+        # Validate YAML files exist
+        missing = [f for f in yaml_files if not f.exists()]
+        if missing:
+            bt.logging.error(f"❌ {len(missing)} YAML files missing!")
+            for f in missing[:5]:
+                bt.logging.error(f"  Missing: {f}")
+            raise FileNotFoundError(f"{len(missing)} YAML files not found")
+        
+        bt.logging.info(f"✓ All {len(yaml_files)} YAML files exist")
+        
+        # Process inputs using Boltz-2's preprocessing
+        cache = Path("~/.boltz").expanduser()
+        mol_dir = cache / "mols"
+        
+        try:
+            manifest = process_inputs(
+                data=yaml_files,
+                out_dir=Path(self.output_dir),  # Will create boltz_results_inputs inside
+                ccd_path=cache / "ccd.pkl",
+                mol_dir=mol_dir,
+                use_msa_server=False,
+                msa_server_url="https://api.colabfold.com",
+                msa_pairing_strategy="greedy",
+                boltz2=True,
+                preprocessing_threads=min(4, len(yaml_files)),
+                max_msa_seqs=8192,
+                precomputed_conformers_dir=Path(self.precomputed_dir) if self.use_precomputed_conformers else None,
             )
             
-            try:
-                # Run Boltz-2 on this batch
-                self._run_boltz_batch(
-                    batch,
-                    structure_model,
-                    affinity_model
-                )
-                
-                # Record performance
-                batch_elapsed = time.time() - batch_start_time
-                self.optimization_manager.record_batch_processing(
-                    len(batch),
-                    batch_elapsed
-                )
-                
-                bt.logging.info(
-                    f"✓ Batch {batch_idx}/{len(batches)} complete in {batch_elapsed:.2f}s "
-                    f"({len(batch)/batch_elapsed:.2f} mol/s)"
-                )
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    bt.logging.error(f"OOM in batch {batch_idx}")
-                    self.optimization_manager.record_oom_event()
-                else:
-                    bt.logging.error(f"Error in batch {batch_idx}: {e}")
-                    bt.logging.error(traceback.format_exc())
+            if manifest is None:
+                raise RuntimeError("process_inputs() returned None")
             
-            except Exception as e:
-                bt.logging.error(f"Unexpected error in batch {batch_idx}: {e}")
-                bt.logging.error(traceback.format_exc())
+            bt.logging.info(f"✓ Input processing complete ({len(manifest.records)} records)")
             
-            finally:
-                # Memory cleanup between batches
-                if self.optimization_manager.enable_memory_optimization:
-                    self.optimization_manager.clear_gpu_cache()
+        except Exception as e:
+            bt.logging.error(f"Failed to process inputs: {e}")
+            bt.logging.error(traceback.format_exc())
+            raise
         
-        total_elapsed = time.time() - total_start_time
+        # ═══════════════════════════════════════════════════════════
+        # ✅ Run predictions using PyTorch Lightning trainer
+        # ═══════════════════════════════════════════════════════════
         
-        bt.logging.info(
-            f"✓ Boltz-2 inference complete in {total_elapsed:.2f}s "
-            f"({len(all_input_files)/total_elapsed:.2f} mol/s)"
+        # Setup data module
+        data_module = Boltz2InferenceDataModule(
+            manifest=manifest,
+            target_dir=processed_dir / "structures",
+            msa_dir=processed_dir / "msa",
+            mol_dir=mol_dir,
+            num_workers=self.config.get('num_workers', 2),
+            constraints_dir=processed_dir / "constraints" if (processed_dir / "constraints").exists() else None,
+            template_dir=processed_dir / "templates" if (processed_dir / "templates").exists() else None,
+            extra_mols_dir=processed_dir / "mols" if (processed_dir / "mols").exists() else None,
+            override_method=None,
+            precomputed_conformers_dir=Path(self.precomputed_dir) if self.use_precomputed_conformers else None,
         )
         
-        # Postprocess results (same as original)
+        # Setup prediction writer
+        pred_writer = BoltzWriter(
+            data_dir=processed_dir / "structures",
+            output_dir=predictions_dir,
+            output_format="pdb",
+            boltz2=True,
+            write_embeddings=False,
+            skip_full_structures=False,
+        )
+        
+        # Setup trainer
+        trainer = Trainer(
+            default_root_dir=boltz_output_dir,
+            callbacks=[pred_writer],
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=[self.device_id],
+            precision="32-true",
+            deterministic=True,
+            benchmark=False,
+        )
+        
+        # Run predictions
+        bt.logging.info(f"Running Boltz-2 structure prediction on {len(manifest.records)} molecules...")
+        total_start_time = time.time()
+        
+        try:
+            with torch.no_grad():
+                trainer.predict(
+                    structure_model,
+                    datamodule=data_module,
+                    return_predictions=False,
+                )
+            
+            total_elapsed = time.time() - total_start_time
+            bt.logging.info(
+                f"✓ Boltz-2 inference complete in {total_elapsed:.2f}s "
+                f"({len(manifest.records)/total_elapsed:.2f} mol/s)"
+            )
+            
+        except Exception as e:
+            bt.logging.error(f"Prediction failed: {e}")
+            bt.logging.error(traceback.format_exc())
+            raise
+        
+        # Postprocess results
         self.postprocess_data(score_dict)
         
         # Log performance summary
         self.optimization_manager.log_performance_summary()
-    
-    def _run_boltz_batch(
-        self,
-        batch: List[Tuple[int, str]],
-        structure_model: Any,
-        affinity_model: Any
-    ) -> None:
-        """
-        Run Boltz-2 prediction on a batch of input files with parallel processing.
-        
-        Since predict() only accepts single paths, we process multiple files
-        in parallel using ThreadPoolExecutor.
-        
-        Args:
-            batch: List of (mol_idx, yaml_path) tuples
-            structure_model: Loaded structure model
-            affinity_model: Loaded affinity model
-        """
-        import concurrent.futures
-        import inspect
-        
-        bt.logging.debug(f"Running Boltz-2 on {len(batch)} molecules (parallel processing)")
-        
-        # Get predict function signature once
-        predict_params = inspect.signature(predict).parameters
-        
-        def process_single_molecule(mol_idx: int, yaml_path: str) -> Tuple[int, bool, Optional[str]]:
-            """
-            Process a single molecule.
-            
-            Returns:
-                (mol_idx, success, error_message)
-            """
-            try:
-                # Build kwargs with only supported parameters
-                kwargs = {
-                    'data': yaml_path,  # ✅ Single path string, not list
-                    'out_dir': self.output_dir,
-                    'cache': Path("~/.boltz").expanduser(),
-                    'devices': [self.device_id],
-                    'accelerator': "gpu" if torch.cuda.is_available() else "cpu",
-                    'num_workers': 1,  # Use 1 worker per prediction to avoid conflicts
-                    'override': False,
-                }
-                
-                # Add optional parameters only if they exist
-                if 'checkpoint' in predict_params:
-                    kwargs['checkpoint'] = None
-                
-                if 'recycling_steps' in predict_params:
-                    kwargs['recycling_steps'] = self.config['recycling_steps']
-                
-                if 'sampling_steps' in predict_params:
-                    kwargs['sampling_steps'] = self.config['sampling_steps']
-                
-                if 'diffusion_samples' in predict_params:
-                    kwargs['diffusion_samples'] = self.config['diffusion_samples']
-                
-                if 'output_format' in predict_params:
-                    kwargs['output_format'] = "pdb"
-                
-                if 'use_msa_server' in predict_params:
-                    kwargs['use_msa_server'] = False
-                
-                if 'msa_server_url' in predict_params:
-                    kwargs['msa_server_url'] = None
-                
-                if 'msa_pairing_strategy' in predict_params:
-                    kwargs['msa_pairing_strategy'] = "greedy"
-                
-                if 'write_full_pae' in predict_params:
-                    kwargs['write_full_pae'] = False
-                
-                if 'write_full_pde' in predict_params:
-                    kwargs['write_full_pde'] = False
-                
-                if 'model' in predict_params:
-                    kwargs['model'] = structure_model
-                
-                if 'affinity_model' in predict_params:
-                    kwargs['affinity_model'] = affinity_model
-                
-                # Call predict with only supported parameters
-                predict(**kwargs)
-                
-                return mol_idx, True, None
-                
-            except Exception as e:
-                error_msg = str(e)
-                bt.logging.debug(f"Prediction failed for mol_idx={mol_idx}: {error_msg}")
-                return mol_idx, False, error_msg
-        
-        # Determine optimal number of parallel workers
-        # Use fewer workers to avoid GPU memory conflicts
-        max_parallel = min(4, len(batch))  # Max 4 parallel predictions per GPU
-        
-        successful = 0
-        failed = 0
-        errors = []
-        
-        # Process molecules in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
-            # Submit all tasks
-            futures = {
-                executor.submit(process_single_molecule, mol_idx, yaml_path): (mol_idx, yaml_path)
-                for mol_idx, yaml_path in batch
-            }
-            
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(futures):
-                mol_idx, yaml_path = futures[future]
-                
-                try:
-                    result_mol_idx, success, error_msg = future.result()
-                    
-                    if success:
-                        successful += 1
-                    else:
-                        failed += 1
-                        if error_msg:
-                            errors.append((result_mol_idx, error_msg))
-                            
-                except Exception as e:
-                    bt.logging.warning(f"Unexpected error processing mol_idx={mol_idx}: {e}")
-                    failed += 1
-                    errors.append((mol_idx, str(e)))
-        
-        # Log summary
-        bt.logging.debug(
-            f"Batch complete: {successful}/{len(batch)} successful, {failed} failed"
-        )
-        
-        # Log unique error types (not every error to avoid spam)
-        if errors:
-            unique_errors = {}
-            for mol_idx, error_msg in errors:
-                error_type = error_msg.split(':')[0] if ':' in error_msg else error_msg
-                if error_type not in unique_errors:
-                    unique_errors[error_type] = []
-                unique_errors[error_type].append(mol_idx)
-            
-            for error_type, mol_indices in unique_errors.items():
-                bt.logging.warning(
-                    f"Error '{error_type}' occurred for {len(mol_indices)} molecules"
-                )
-        
-        # Only raise if ALL predictions failed
-        if successful == 0 and len(batch) > 0:
-            raise RuntimeError(f"All {len(batch)} predictions failed in batch")
 
     # ========================================================================
     # POSTPROCESSING (same as original)
@@ -864,8 +829,10 @@ properties:
         scores = {}
         for smiles, id_list in self.unique_molecules.items():
             mol_idx = id_list[0][1]
+            
+            # ✅ Results are in: {output_dir}/boltz_results_inputs/predictions/{mol_idx}/
             results_path = os.path.join(
-                self.output_dir, 'boltz_results_inputs', 'predictions', f'{mol_idx}'
+                self.output_dir, 'boltz_results_inputs', 'predictions', str(mol_idx)
             )
             
             if not os.path.exists(results_path):
@@ -875,27 +842,35 @@ properties:
             if mol_idx not in scores:
                 scores[mol_idx] = {}
             
-            for filepath in os.listdir(results_path):
-                if filepath.startswith('affinity'):
-                    with open(os.path.join(results_path, filepath), 'r') as f:
-                        affinity_data = json.load(f)
-                    scores[mol_idx].update(affinity_data)
-                elif filepath.startswith('confidence'):
-                    with open(os.path.join(results_path, filepath), 'r') as f:
-                        confidence_data = json.load(f)
-                    scores[mol_idx].update(confidence_data)
+            try:
+                for filepath in os.listdir(results_path):
+                    if filepath.startswith('affinity'):
+                        with open(os.path.join(results_path, filepath), 'r') as f:
+                            affinity_data = json.load(f)
+                        scores[mol_idx].update(affinity_data)
+                    elif filepath.startswith('confidence'):
+                        with open(os.path.join(results_path, filepath), 'r') as f:
+                            confidence_data = json.load(f)
+                        scores[mol_idx].update(confidence_data)
+            except Exception as e:
+                bt.logging.error(f"Error reading results for mol_idx={mol_idx}: {e}")
+                continue
         
         # Cleanup files
         if self.config.get('remove_files', False):
             bt.logging.info("Removing temporary files")
-            results_dir = Path(self.output_dir) / 'boltz_results_inputs'
-            if results_dir.exists():
-                shutil.rmtree(results_dir)
             
+            # Clean up boltz_results_inputs directory
+            boltz_results_dir = Path(self.output_dir) / 'boltz_results_inputs'
+            if boltz_results_dir.exists():
+                shutil.rmtree(boltz_results_dir)
+            
+            # Clean up YAML files
             yaml_files = list(Path(self.input_dir).glob("*.yaml"))
             for yaml_file in yaml_files:
                 yaml_file.unlink()
-            bt.logging.info("Files removed")
+            
+            bt.logging.info(f"Removed {len(yaml_files)} YAML files and result directories")
         
         # Distribute results to all UIDs
         self.per_molecule_metric = {}
@@ -906,12 +881,10 @@ properties:
                 if uid not in final_boltz_scores:
                     final_boltz_scores[uid] = []
                 
-                # Check if we have scores for this molecule
                 if mol_idx not in scores:
                     bt.logging.warning(f"No scores found for mol_idx={mol_idx}, uid={uid}")
                     continue
                 
-                # Check if the metric exists
                 if self.subnet_config['boltz_metric'] not in scores[mol_idx]:
                     bt.logging.warning(
                         f"Metric '{self.subnet_config['boltz_metric']}' not found for mol_idx={mol_idx}. "
@@ -934,7 +907,7 @@ properties:
             else:
                 data['boltz_score'] = -math.inf
                 bt.logging.warning(f"No valid Boltz scores for UID={uid}, setting to -inf")
-    
+
     # ========================================================================
     # UTILITY METHODS
     # ========================================================================

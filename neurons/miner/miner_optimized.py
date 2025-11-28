@@ -1190,7 +1190,7 @@ async def perform_periodic_maintenance(
         bt.logging.info(
             f"Elite Optimizer: "
             f"elite_frac={es_stats['current_elite_frac']:.3f}, "
-            f"diversity={es_stats['current_diversity']:.3f}, "
+            f"diversity={es_stats.get('current_diversity', 0.0):.3f}, ",
             f"trend={es_stats['score_trend']}"
         )
         
