@@ -276,6 +276,7 @@ class Boltz2(LightningModule):
             k: v for k, v in score_model_args.items() 
             if k not in ['offload_to_cpu']
         }
+        
         # Output modules
         self.structure_module = AtomDiffusion(
             score_model_args={
@@ -1221,14 +1222,22 @@ class Boltz2(LightningModule):
         return optimizer
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Load checkpoint with backward compatibility for missing keys."""
         # Ignore the lr from the checkpoint
         lr = self.training_args.max_lr
-        weight_decay = self.training_args.weight_decay
+        
+        # Handle missing weight_decay gracefully (OmegaConf compatible)
+        try:
+            weight_decay = self.training_args.weight_decay
+        except Exception:
+            weight_decay = 0.0
+        
         if "optimizer_states" in checkpoint:
             for state in checkpoint["optimizer_states"]:
                 for group in state["param_groups"]:
                     group["lr"] = lr
                     group["weight_decay"] = weight_decay
+        
         if "lr_schedulers" in checkpoint:
             for scheduler in checkpoint["lr_schedulers"]:
                 scheduler["max_lr"] = lr
@@ -1238,15 +1247,30 @@ class Boltz2(LightningModule):
         # Ignore the training diffusion_multiplicity and recycling steps from the checkpoint
         if "hyper_parameters" in checkpoint:
             checkpoint["hyper_parameters"]["training_args"]["max_lr"] = lr
-            checkpoint["hyper_parameters"]["training_args"][
-                "diffusion_multiplicity"
-            ] = self.training_args.diffusion_multiplicity
-            checkpoint["hyper_parameters"]["training_args"]["recycling_steps"] = (
-                self.training_args.recycling_steps
-            )
-            checkpoint["hyper_parameters"]["training_args"]["weight_decay"] = (
-                self.training_args.weight_decay
-            )
+            
+            # Handle diffusion_multiplicity
+            try:
+                checkpoint["hyper_parameters"]["training_args"]["diffusion_multiplicity"] = (
+                    self.training_args.diffusion_multiplicity
+                )
+            except Exception:
+                pass
+            
+            # Handle recycling_steps
+            try:
+                checkpoint["hyper_parameters"]["training_args"]["recycling_steps"] = (
+                    self.training_args.recycling_steps
+                )
+            except Exception:
+                pass
+            
+            # Handle weight_decay
+            try:
+                checkpoint["hyper_parameters"]["training_args"]["weight_decay"] = (
+                    self.training_args.weight_decay
+                )
+            except Exception:
+                checkpoint["hyper_parameters"]["training_args"]["weight_decay"] = 0.0
 
     def configure_callbacks(self) -> list[Callback]:
         """Configure model callbacks.
