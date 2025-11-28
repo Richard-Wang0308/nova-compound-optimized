@@ -28,7 +28,7 @@ uv pip install -r requirements/requirements.txt \
 && uv pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.7.0+cu126.html \
 && uv pip install patchelf \
 && uv pip install maturin==1.8.3 \
-&& uv pip install -e nova/boltz
+&& uv pip install -e boltz
 
 # Build timelock Python bindings (WASM)
 export PYO3_CROSS_PYTHON_VERSION="3.12" && cd timelock/wasm && ./wasm_build_py.sh && cd ../..

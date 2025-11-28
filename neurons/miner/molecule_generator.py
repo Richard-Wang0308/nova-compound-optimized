@@ -1,20 +1,23 @@
 """
-Optimized molecular generation using pre-loaded pools and caching.
+Optimized molecular generation with multiprocessing support.
 
 Performance optimizations:
-1. Increased max_workers with adaptive scaling
+1. Multiprocessing with proper worker initialization
 2. Batch RDKit molecule validations with vectorization
-3. Multiprocessing for CPU-bound validation tasks
+3. Adaptive worker scaling based on system resources
+4. Descriptor caching for faster validation
 """
 
 import os
+import sys
 import random
 import math
 import time
-from typing import List, Dict, Tuple, Optional, Any
+import multiprocessing as mp
+from typing import List, Dict, Tuple, Optional, Any, Set
 from collections import defaultdict
 from functools import partial
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import numpy as np
 
 from rdkit import Chem
@@ -23,9 +26,9 @@ import pandas as pd
 import bittensor as bt
 
 # FIXED IMPORTS
-from miner.cache_manager import MoleculePoolCache, PersistentSMILESCache
-from miner.integrated_cache import IntegratedCacheManager
-from miner.descriptor_cache import MolecularDescriptorCache, get_descriptor_cache
+from neurons.miner.cache_manager import MoleculePoolCache, PersistentSMILESCache
+from neurons.miner.integrated_cache import IntegratedCacheManager
+from neurons.miner.descriptor_cache import MolecularDescriptorCache, get_descriptor_cache
 from combinatorial_db.reactions import (
     perform_smarts_reaction,
     validate_and_order_reactants
@@ -33,14 +36,48 @@ from combinatorial_db.reactions import (
 
 
 # ============================================================================
-# WORKER MANAGEMENT (Solution 1: Adaptive Workers)
+# WORKER INITIALIZATION FOR MULTIPROCESSING
+# ============================================================================
+
+def _init_worker():
+    """
+    Initialize worker process.
+    
+    This ensures each worker has proper paths and can import modules.
+    Called once per worker process at startup.
+    """
+    import sys
+    import os
+    import logging
+    import random
+    
+    # Reconstruct paths in worker
+    current_file = os.path.abspath(__file__)
+    miner_dir = os.path.dirname(current_file)
+    neurons_dir = os.path.dirname(miner_dir)
+    project_root = os.path.dirname(neurons_dir)
+    
+    # Add to path if not present
+    for path in [project_root, neurons_dir, miner_dir]:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    
+    # Suppress worker logging to avoid spam
+    logging.getLogger('multiprocessing').setLevel(logging.ERROR)
+    
+    # Seed random for this worker
+    random.seed(os.getpid())
+
+
+# ============================================================================
+# WORKER MANAGEMENT
 # ============================================================================
 
 def get_optimal_worker_count() -> int:
     """
     Determine optimal worker count based on system resources.
     """
-    cpu_count = os.cpu_count() or 4
+    cpu_count = mp.cpu_count() or 4
     
     # For mixed CPU/I/O workload: use 1.5-2x CPU count
     # Cap at 32 to avoid excessive overhead
@@ -54,7 +91,7 @@ def adaptive_worker_count() -> int:
     """
     try:
         import psutil
-        cpu_count = os.cpu_count() or 4
+        cpu_count = mp.cpu_count() or 4
         cpu_percent = psutil.cpu_percent(interval=0.1)
         memory_percent = psutil.virtual_memory().percent
         
@@ -168,7 +205,7 @@ def get_smiles_from_reaction_cached(
     1. Database queries for molecule SMILES
     2. Repeated reaction computations for same reactants
     """
-    # Check cache first - FIXED
+    # Check cache first
     cached_smiles = cache_manager.smiles_cache.get(product_name)
     if cached_smiles:
         return cached_smiles
@@ -203,7 +240,7 @@ def get_smiles_from_reaction_cached(
             # Perform reaction
             result_smiles = perform_smarts_reaction(reactant1, reactant2, roles['smarts'])
             
-            # Cache result - FIXED
+            # Cache result
             if result_smiles:
                 cache_manager.smiles_cache.set(product_name, result_smiles)
             
@@ -249,7 +286,7 @@ def get_smiles_from_reaction_cached(
                 
                 result_smiles = perform_smarts_reaction(intermediate, reactant3, suzuki_cl_smarts)
                 
-                # Cache result - FIXED
+                # Cache result
                 if result_smiles:
                     cache_manager.smiles_cache.set(product_name, result_smiles)
                 
@@ -336,7 +373,7 @@ def generate_offspring_from_elites_optimized(
 
 
 # ============================================================================
-# VALIDATION (Solution 2: Batch RDKit + Solution 3: Multiprocessing)
+# VALIDATION WITH MULTIPROCESSING
 # ============================================================================
 
 def ultra_light_prefilter(
@@ -349,20 +386,11 @@ def ultra_light_prefilter(
 ) -> Tuple[bool, Optional[str]]:
     """
     Ultra-light prefilter with early exit optimization and descriptor caching.
-    
-    Strategy:
-    1. Check cache first (fastest)
-    2. Order checks from cheapest to most expensive
-    3. Exit immediately on first failure (early exit)
-    4. Cache descriptors for future use
-    
-    Returns:
-        (is_valid, rejection_reason)
     """
     descriptor_cache = get_descriptor_cache()
     
     try:
-        # Step 1: Check descriptor cache first
+        # Check descriptor cache first
         cached_descriptors = descriptor_cache.get(smiles)
         
         if cached_descriptors:
@@ -385,32 +413,25 @@ def ultra_light_prefilter(
             
             return True, None
         
-        # Step 2: Compute descriptors if not cached
+        # Compute descriptors if not cached
         mol = Chem.MolFromSmiles(smiles)
         if not mol:
             return False, "invalid_smiles"
         
-        # Step 3: Check properties in order of computational cost (cheapest first)
-        # This allows early exit without computing expensive descriptors
-        
-        # Cheapest: Heavy atoms (just counting)
+        # Check properties in order of computational cost (cheapest first)
         heavy = mol.GetNumHeavyAtoms()
         if heavy < heavy_min:
-            # Cache partial result for future reference
             descriptor_cache.set(smiles, {'heavy_atoms': heavy})
             return False, "heavy_atoms_low"
         
-        # Medium cost: Rotatable bonds
         rot = Descriptors.NumRotatableBonds(mol)
         if not (rot_min <= rot <= rot_max):
-            # Cache partial result
             descriptor_cache.set(smiles, {
                 'heavy_atoms': heavy,
                 'rotatable_bonds': rot
             })
             return False, "rotatable_bonds"
         
-        # More expensive: Molecular weight
         mw = Descriptors.MolWt(mol)
         if mw > mw_max:
             descriptor_cache.set(smiles, {
@@ -420,7 +441,6 @@ def ultra_light_prefilter(
             })
             return False, "mw_high"
         
-        # Most expensive: TPSA (surface area calculation)
         tpsa = Descriptors.TPSA(mol)
         if tpsa > tpsa_max:
             descriptor_cache.set(smiles, {
@@ -450,91 +470,6 @@ def ultra_light_prefilter(
         return False, "rdkit_error"
 
 
-def validate_molecules_batch_vectorized(
-    smiles_list: List[str],
-    names_list: List[str],
-    rot_min: int,
-    rot_max: int,
-    heavy_min: int,
-    mw_max: float,
-    tpsa_max: float,
-    seen_keys: set
-) -> Tuple[List[str], List[str], List[str], Dict[str, int]]:
-    """
-    Solution 2: Vectorized batch validation of molecules using numpy.
-    
-    Returns:
-        valid_names, valid_smiles, valid_inchikeys, rejection_stats
-    """
-    rejection_stats = {
-        'invalid_smiles': 0,
-        'heavy_atoms_low': 0,
-        'rotatable_bonds': 0,
-        'mw_high': 0,
-        'tpsa_high': 0,
-        'duplicate': 0
-    }
-    
-    # Step 1: Batch convert SMILES to Mol objects
-    mol_objects = []
-    valid_indices = []
-    
-    for idx, smiles in enumerate(smiles_list):
-        mol = Chem.MolFromSmiles(smiles)
-        if mol:
-            mol_objects.append(mol)
-            valid_indices.append(idx)
-        else:
-            rejection_stats['invalid_smiles'] += 1
-    
-    if not mol_objects:
-        return [], [], [], rejection_stats
-    
-    # Step 2: Batch compute all descriptors (vectorized with numpy)
-    heavy_atoms = np.array([mol.GetNumHeavyAtoms() for mol in mol_objects])
-    rot_bonds = np.array([Descriptors.NumRotatableBonds(mol) for mol in mol_objects])
-    mol_weights = np.array([Descriptors.MolWt(mol) for mol in mol_objects])
-    tpsa_values = np.array([Descriptors.TPSA(mol) for mol in mol_objects])
-    
-    # Step 3: Vectorized filtering (numpy boolean indexing)
-    valid_mask = (
-        (heavy_atoms >= heavy_min) &
-        (rot_bonds >= rot_min) &
-        (rot_bonds <= rot_max) &
-        (mol_weights <= mw_max) &
-        (tpsa_values <= tpsa_max)
-    )
-    
-    # Count rejections
-    rejection_stats['heavy_atoms_low'] = int(np.sum(heavy_atoms < heavy_min))
-    rejection_stats['rotatable_bonds'] = int(np.sum((rot_bonds < rot_min) | (rot_bonds > rot_max)))
-    rejection_stats['mw_high'] = int(np.sum(mol_weights > mw_max))
-    rejection_stats['tpsa_high'] = int(np.sum(tpsa_values > tpsa_max))
-    
-    # Step 4: Generate InChIKeys for valid molecules only
-    valid_names = []
-    valid_smiles = []
-    valid_inchikeys = []
-    
-    for idx, is_valid in enumerate(valid_mask):
-        if is_valid:
-            original_idx = valid_indices[idx]
-            mol = mol_objects[idx]
-            
-            try:
-                inchikey = Chem.MolToInchiKey(mol)
-                if inchikey not in seen_keys:
-                    valid_names.append(names_list[original_idx])
-                    valid_smiles.append(smiles_list[original_idx])
-                    valid_inchikeys.append(inchikey)
-                else:
-                    rejection_stats['duplicate'] += 1
-            except:
-                rejection_stats['invalid_smiles'] += 1
-    
-    return valid_names, valid_smiles, valid_inchikeys, rejection_stats
-
-
 def validate_molecule_chunk_worker(
     chunk_data: Tuple[List[str], List[str]],
     rot_min: int,
@@ -544,7 +479,7 @@ def validate_molecule_chunk_worker(
     tpsa_max: float
 ) -> Tuple[List[Tuple[str, str, str]], Dict[str, int]]:
     """
-    Solution 3: Worker function for multiprocessing.
+    Worker function for multiprocessing validation.
     Validates a chunk of molecules in a separate process.
     
     Args:
@@ -618,6 +553,91 @@ def chunk_list(data: List, n_chunks: int) -> List[List]:
     return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
 
 
+def validate_molecules_batch_vectorized(
+    smiles_list: List[str],
+    names_list: List[str],
+    rot_min: int,
+    rot_max: int,
+    heavy_min: int,
+    mw_max: float,
+    tpsa_max: float,
+    seen_keys: set
+) -> Tuple[List[str], List[str], List[str], Dict[str, int]]:
+    """
+    Vectorized batch validation of molecules using numpy.
+    
+    Returns:
+        valid_names, valid_smiles, valid_inchikeys, rejection_stats
+    """
+    rejection_stats = {
+        'invalid_smiles': 0,
+        'heavy_atoms_low': 0,
+        'rotatable_bonds': 0,
+        'mw_high': 0,
+        'tpsa_high': 0,
+        'duplicate': 0
+    }
+    
+    # Batch convert SMILES to Mol objects
+    mol_objects = []
+    valid_indices = []
+    
+    for idx, smiles in enumerate(smiles_list):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            mol_objects.append(mol)
+            valid_indices.append(idx)
+        else:
+            rejection_stats['invalid_smiles'] += 1
+    
+    if not mol_objects:
+        return [], [], [], rejection_stats
+    
+    # Batch compute all descriptors (vectorized with numpy)
+    heavy_atoms = np.array([mol.GetNumHeavyAtoms() for mol in mol_objects])
+    rot_bonds = np.array([Descriptors.NumRotatableBonds(mol) for mol in mol_objects])
+    mol_weights = np.array([Descriptors.MolWt(mol) for mol in mol_objects])
+    tpsa_values = np.array([Descriptors.TPSA(mol) for mol in mol_objects])
+    
+    # Vectorized filtering (numpy boolean indexing)
+    valid_mask = (
+        (heavy_atoms >= heavy_min) &
+        (rot_bonds >= rot_min) &
+        (rot_bonds <= rot_max) &
+        (mol_weights <= mw_max) &
+        (tpsa_values <= tpsa_max)
+    )
+    
+    # Count rejections
+    rejection_stats['heavy_atoms_low'] = int(np.sum(heavy_atoms < heavy_min))
+    rejection_stats['rotatable_bonds'] = int(np.sum((rot_bonds < rot_min) | (rot_bonds > rot_max)))
+    rejection_stats['mw_high'] = int(np.sum(mol_weights > mw_max))
+    rejection_stats['tpsa_high'] = int(np.sum(tpsa_values > tpsa_max))
+    
+    # Generate InChIKeys for valid molecules only
+    valid_names = []
+    valid_smiles = []
+    valid_inchikeys = []
+    
+    for idx, is_valid in enumerate(valid_mask):
+        if is_valid:
+            original_idx = valid_indices[idx]
+            mol = mol_objects[idx]
+            
+            try:
+                inchikey = Chem.MolToInchiKey(mol)
+                if inchikey not in seen_keys:
+                    valid_names.append(names_list[original_idx])
+                    valid_smiles.append(smiles_list[original_idx])
+                    valid_inchikeys.append(inchikey)
+                else:
+                    rejection_stats['duplicate'] += 1
+            except:
+                rejection_stats['invalid_smiles'] += 1
+    
+    return valid_names, valid_smiles, valid_inchikeys, rejection_stats
+
+
 def validate_molecules_multiprocessing(
     names_list: List[str],
     smiles_list: List[str],
@@ -630,12 +650,12 @@ def validate_molecules_multiprocessing(
     n_workers: int = None
 ) -> Tuple[List[str], List[str], List[str], Dict[str, int]]:
     """
-    Solution 3: Validate molecules using multiprocessing for true parallelism.
+    Validate molecules using multiprocessing for true parallelism.
     
     This bypasses Python's GIL for CPU-bound RDKit operations.
     """
     if n_workers is None:
-        n_workers = os.cpu_count() or 4
+        n_workers = get_optimal_worker_count()
     
     # For small batches, don't use multiprocessing (overhead not worth it)
     if len(names_list) < 100:
@@ -662,7 +682,14 @@ def validate_molecules_multiprocessing(
     
     # Process in parallel with error handling
     try:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        # Get multiprocessing context
+        ctx = mp.get_context()
+        
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_init_worker
+        ) as pool:
             # Add timeout to prevent hanging
             results = list(pool.map(worker, chunks, timeout=300))  # 5 min timeout
     
@@ -833,10 +860,11 @@ def generate_valid_molecules_batch_optimized(
     n_workers: int = None
 ) -> dict:
     """
-    Optimized version with all three performance solutions:
-    1. Adaptive worker management
-    2. Batch RDKit validations
-    3. Multiprocessing for CPU-bound tasks
+    Optimized version with multiprocessing enabled.
+    
+    Args:
+        use_multiprocessing: Enable/disable multiprocessing (default: True)
+        n_workers: Number of workers (default: auto-detect)
     """
     start_time = time.time()
     
@@ -906,7 +934,7 @@ def generate_valid_molecules_batch_optimized(
             
             total_generated += len(batch_molecules)
             
-            # Batch SMILES generation with caching - FIXED
+            # Batch SMILES generation with caching
             batch_smiles_map = {}  # {name: smiles}
             for name in batch_molecules:
                 smiles = get_smiles_from_reaction_cached(name, pool_cache, cache_manager)
@@ -967,17 +995,18 @@ def generate_valid_molecules_batch_optimized(
     
     # Log performance statistics
     success_rate = total_validated / total_generated if total_generated > 0 else 0
+    worker_mode = f"{n_workers}" if use_multiprocessing else "vectorized"
     bt.logging.info(
         f"Generation complete: {total_validated}/{total_generated} valid "
         f"({success_rate:.1%}) in {elapsed_time:.2f}s "
         f"({total_validated/elapsed_time:.1f} mol/s) "
-        f"[workers: {n_workers}, cache hit rate: {cache_stats['hit_rate']:.1%}]"
+        f"[workers: {worker_mode}, cache hit rate: {cache_stats['hit_rate']:.1%}]"
     )
     
     if rejection_stats_total:
         bt.logging.debug(f"Rejection breakdown: {dict(rejection_stats_total)}")
     
-    # Add cache stats to return dict
+    # Return results
     return {
         'molecules': all_valid_molecules,
         'smiles': all_valid_smiles,
@@ -989,6 +1018,7 @@ def generate_valid_molecules_batch_optimized(
             'elapsed_time': elapsed_time,
             'throughput': total_validated / elapsed_time if elapsed_time > 0 else 0,
             'n_workers': n_workers,
+            'use_multiprocessing': use_multiprocessing,
             'rejection_stats': dict(rejection_stats_total),
             'descriptor_cache': cache_stats
         }
@@ -1044,8 +1074,6 @@ def adaptive_batch_size(
 ) -> int:
     """
     Adaptively adjust batch size based on success rate.
-    Low success rate → increase batch size
-    High success rate → decrease batch size
     """
     if success_rate < 0.05:
         new_size = int(current_batch_size * 1.5)

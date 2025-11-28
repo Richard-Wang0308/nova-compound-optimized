@@ -10,6 +10,7 @@ Performance improvements:
 - RAM management with intelligent caching
 - Vectorized elite selection and component weighting
 - Comprehensive timing and profiling
+- MULTIPROCESSING ENABLED for molecule generation
 
 All critical bugs fixed:
 - Fixed shutdown deadlock (graceful cancellation with shield)
@@ -19,10 +20,42 @@ All critical bugs fixed:
 - Fixed resource leaks (proper executor cleanup)
 - Optimized block queries (caching)
 - Added comprehensive timing tracking
+- Fixed multiprocessing module import issues
 """
 
 import os
 import sys
+
+# Get project root (2 levels up from this file)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add to path
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+
+import multiprocessing as mp
+
+# ============================================================================
+# CRITICAL: Multiprocessing Setup - MUST BE FIRST
+# ============================================================================
+
+if __name__ == "__main__":
+    try:
+        import platform
+        # Use 'fork' on Linux (faster, no import issues)
+        # Use 'spawn' on Windows/Mac
+        if platform.system() == 'Linux':
+            mp.set_start_method('fork', force=True)
+        else:
+            mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
+
+# ============================================================================
+# Standard Imports
+# ============================================================================
 import math
 import random
 import argparse
@@ -34,9 +67,15 @@ import shutil
 import base64
 import hashlib
 import time
+import logging
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from asyncio import Lock
+
+# Suppress multiprocessing warnings
+logging.getLogger('multiprocessing').setLevel(logging.ERROR)
+warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
 
 from dotenv import load_dotenv
 import bittensor as bt
@@ -46,11 +85,9 @@ import pandas as pd
 import torch
 import gc
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(BASE_DIR)
-
-# Set DEVICE_OVERRIDE before importing modules
-os.environ.setdefault('DEVICE_OVERRIDE', 'cuda:0')
+# ============================================================================
+# Project Imports
+# ============================================================================
 
 from config.config_loader import load_config
 from utils import (
@@ -58,26 +95,27 @@ from utils import (
     get_challenge_params_from_blockhash,
     is_reaction_allowed,
 )
+
 from boltz.enhanced_wrapper import EnhancedBoltzWrapper
 from btdr import QuicknetBittensorDrandTimelock
 
 # Import optimized cache and generation modules
-from miner.cache_manager import (
+from neurons.miner.cache_manager import (
     MoleculePoolCache,
     PersistentSMILESCache,
     WeeklyTargetCache,
     EpochAntitargetCache,
     get_reaction_roles,
 )
-from miner.integrated_cache import IntegratedCacheManager, create_integrated_cache
-from miner.molecule_generator import (
+from neurons.miner.integrated_cache import IntegratedCacheManager, create_integrated_cache
+from neurons.miner.molecule_generator import (
     generate_valid_molecules_batch_optimized,
     ultra_light_prefilter,
 )
 
 # Import timing tracker
 try:
-    from miner.timing_tracker import TimingTracker
+    from neurons.miner.timing_tracker import TimingTracker
     TIMING_TRACKER_AVAILABLE = True
 except ImportError:
     bt.logging.warning("timing_tracker not available, timing disabled")
@@ -85,7 +123,7 @@ except ImportError:
 
 # Import RAM management
 try:
-    from miner.ram_manager import (
+    from neurons.miner.ram_manager import (
         IntegratedRAMManager,
         EfficientDataFrameManager,
         optimize_dataframe_memory
@@ -97,7 +135,7 @@ except ImportError:
 
 # Import elite optimizer
 try:
-    from miner.elite_optimizer import (
+    from neurons.miner.elite_optimizer import (
         IntegratedEliteOptimizer,
         VectorizedComponentWeightCalculator,
         AdaptiveEliteSelector
@@ -109,7 +147,7 @@ except ImportError:
 
 # Import GPU memory management
 try:
-    from miner.gpu_memory_manager import (
+    from neurons.miner.gpu_memory_manager import (
         IntegratedGPUMemoryManager,
         create_gpu_memory_managers,
         gpu_memory_context,
@@ -120,6 +158,29 @@ except ImportError:
     bt.logging.warning("gpu_memory_manager not available, using basic memory management")
     GPU_MEMORY_MANAGER_AVAILABLE = False
 
+# ============================================================================
+# Suppress Multiprocessing Logging Errors
+# ============================================================================
+
+import logging
+import warnings
+from logging.handlers import QueueHandler, QueueListener
+
+# Disable multiprocessing queue logging to prevent EOFError
+logging.logMultiprocessing = False
+logging.logProcesses = False
+logging.logThreads = False
+
+# Suppress all multiprocessing warnings
+warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
+warnings.filterwarnings('ignore', message='.*EOFError.*')
+warnings.filterwarnings('ignore', message='.*multiprocessing.*')
+
+# Set multiprocessing logger to ERROR only
+mp_logger = logging.getLogger('multiprocessing')
+mp_logger.setLevel(logging.ERROR)
+mp_logger.handlers.clear()
+mp_logger.propagate = False
 
 # ============================================================================
 # CONSTANTS
@@ -147,7 +208,6 @@ DEFAULT_ELITE_FRAC = 0.25
 
 # Cache warming constants
 CACHE_WARMUP_SAMPLES = 2000
-
 
 # ============================================================================
 # CONFIG & ARGUMENT PARSING
@@ -362,7 +422,7 @@ async def prewarm_caches_for_epoch(
     Pre-warm caches at the start of each epoch.
     Note: Only warms SMILES cache. Target/antitarget scoring done by Boltz-2.
     """
-    from miner.molecule_generator import (
+    from neurons.miner.molecule_generator import (
         generate_molecules_from_pools_optimized,
         get_smiles_from_reaction_cached
     )
@@ -527,7 +587,7 @@ async def run_optimized_pipeline_with_caching(state: Dict[str, Any]) -> None:
     mutation_prob = DEFAULT_MUTATION_PROB
     n_samples_per_reaction = DEFAULT_N_SAMPLES_PER_REACTION
     
-    bt.logging.info("Starting optimized pipeline with all enhancements")
+    bt.logging.info("Starting optimized pipeline with MULTIPROCESSING ENABLED")
     
     while not state['shutdown_event'].is_set():
         try:
@@ -602,8 +662,10 @@ async def process_iteration(
         
         # If too close to deadline, skip scoring (submission monitor will handle it)
         if blocks_remaining <= SUBMISSION_DEADLINE_BLOCKS + 5:
-            bt.logging.debug(f"⏰ Only {blocks_remaining} blocks remaining, skipping iteration")
+            bt.logging.info(f"⏰ Only {blocks_remaining} blocks remaining until epoch {next_epoch}, skipping iteration (waiting for new epoch)")
             return
+        
+        bt.logging.debug(f"📊 Blocks remaining: {blocks_remaining}, proceeding with iteration")
         
         # Cache empty check
         has_pool = not current_pool.empty
@@ -643,13 +705,14 @@ async def process_iteration(
                 elite_names_dict[4] = [n for n in elite_df['product_name'] if n.startswith("rxn:4:")]
                 elite_names_dict[5] = [n for n in elite_df['product_name'] if n.startswith("rxn:5:")]
         
-        # Generate molecules with timing
+        # Generate molecules with timing (MULTIPROCESSING ENABLED)
         generation_start = time.time()
         
         loop = asyncio.get_event_loop()
         executor = state.get('molecule_gen_executor', ThreadPoolExecutor(max_workers=4, thread_name_prefix="molgen"))
         state['molecule_gen_executor'] = executor
         
+        # CRITICAL: Pass True as last parameter to enable multiprocessing
         sampler_data = await loop.run_in_executor(
             executor,
             generate_valid_molecules_batch_optimized,
@@ -663,7 +726,10 @@ async def process_iteration(
             elite_frac,
             mutation_prob,
             seen_inchikeys,
-            component_weights_dict
+            component_weights_dict,
+            # True,  # ← ENABLE MULTIPROCESSING
+            False,
+            None   # ← n_workers (None = auto-detect)
         )
         
         generation_elapsed = time.time() - generation_start

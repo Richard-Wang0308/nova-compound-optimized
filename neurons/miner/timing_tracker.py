@@ -203,18 +203,45 @@ class TimingTracker:
         
         bt.logging.info(f"⏱️  Iteration {iteration} Timing:")
         bt.logging.info(f"  Total:      {last_iter_time:.2f}s")
-        bt.logging.info(f"  Generation: {last_gen_time:.2f}s ({last_gen_count} molecules, {last_gen_count/last_gen_time:.1f} mol/s)")
-        bt.logging.info(f"  Inference:  {last_inf_time:.2f}s ({last_scored_count} molecules, {last_scored_count/last_inf_time:.1f} mol/s)")
-        bt.logging.info(f"  Pool Update: {last_pool_time:.3f}s")
+        
+        # FIX: Safe division with zero checks
+        if last_gen_time > 0:
+            if last_gen_count > 0:
+                gen_throughput = last_gen_count / last_gen_time
+                bt.logging.info(f"  Generation: {last_gen_time:.2f}s ({last_gen_count} molecules, {gen_throughput:.1f} mol/s)")
+            else:
+                bt.logging.info(f"  Generation: {last_gen_time:.2f}s (0 molecules)")
+        else:
+            if last_gen_count > 0:
+                bt.logging.info(f"  Generation: <0.01s ({last_gen_count} molecules)")
+            else:
+                bt.logging.info(f"  Generation: skipped")
+        
+        if last_inf_time > 0:
+            if last_scored_count > 0:
+                inf_throughput = last_scored_count / last_inf_time
+                bt.logging.info(f"  Inference:  {last_inf_time:.2f}s ({last_scored_count} molecules, {inf_throughput:.1f} mol/s)")
+            else:
+                bt.logging.info(f"  Inference:  {last_inf_time:.2f}s (0 molecules)")
+        else:
+            if last_scored_count > 0:
+                bt.logging.info(f"  Inference:  <0.01s ({last_scored_count} molecules)")
+            else:
+                bt.logging.info(f"  Inference:  skipped")
+        
+        if last_pool_time > 0:
+            bt.logging.info(f"  Pool Update: {last_pool_time:.3f}s")
         
         # Per-GPU breakdown
         if self.gpu_inference_times:
-            bt.logging.info(f"  GPU Breakdown:")
-            for gpu_id in sorted(self.gpu_inference_times.keys()):
-                if self.gpu_inference_times[gpu_id]:
-                    gpu_time = self.gpu_inference_times[gpu_id][-1]
-                    bt.logging.info(f"    GPU {gpu_id}: {gpu_time:.2f}s")
-    
+            has_gpu_data = any(len(times) > 0 for times in self.gpu_inference_times.values())
+            if has_gpu_data:
+                bt.logging.info(f"  GPU Breakdown:")
+                for gpu_id in sorted(self.gpu_inference_times.keys()):
+                    if self.gpu_inference_times[gpu_id]:
+                        gpu_time = self.gpu_inference_times[gpu_id][-1]
+                        bt.logging.info(f"    GPU {gpu_id}: {gpu_time:.2f}s")
+
     def print_comprehensive_report(self):
         """Print comprehensive timing report."""
         stats = self.get_comprehensive_stats()
