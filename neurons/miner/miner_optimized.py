@@ -23,6 +23,7 @@ All critical bugs fixed:
 - Fixed multiprocessing module import issues
 - Fixed WebSocket concurrency errors (thread-safe subtensor access)
 - Fixed metagraph.sync TypeError
+- Fixed multiprocessing logging EOFError spam
 """
 
 import os
@@ -35,11 +36,94 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+# ============================================================================
+# CRITICAL: Fix multiprocessing logging BEFORE any other imports
+# ============================================================================
+import logging
+import logging.handlers
+import warnings
 
+def _patch_multiprocessing_logging():
+    """
+    Global patch for multiprocessing logging to prevent EOFError spam.
+    This must be called before any multiprocessing workers are created.
+    """
+    # Completely disable multiprocessing logging
+    logging.logMultiprocessing = False
+    logging.logProcesses = False
+    logging.logThreads = False
+    
+    # Patch QueueListener._monitor to handle worker exits gracefully
+    original_monitor = logging.handlers.QueueListener._monitor
+    
+    def safe_monitor(self):
+        """Monitor with graceful error handling for worker exits."""
+        q = self.queue
+        has_task_done = hasattr(q, 'task_done')
+        
+        while True:
+            try:
+                record = self.dequeue(True)
+                if record is self._sentinel:
+                    break
+                self.handle(record)
+                if has_task_done:
+                    q.task_done()
+            except (EOFError, BrokenPipeError, OSError, ValueError):
+                # Worker process exited - stop monitoring silently
+                break
+            except Exception as e:
+                # Log unexpected errors to stderr but continue
+                import traceback
+                print(f"[Logging Monitor Error] {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                continue
+    
+    # Apply the monkey patch globally
+    logging.handlers.QueueListener._monitor = safe_monitor
+    
+    # Patch QueueHandler.__init__ to handle queue errors
+    original_queue_handler_init = logging.handlers.QueueHandler.__init__
+    
+    def patched_queue_handler_init(self, queue):
+        """Patched QueueHandler that handles queue errors gracefully."""
+        try:
+            original_queue_handler_init(self, queue)
+        except (EOFError, OSError, ValueError, BrokenPipeError):
+            # Silently ignore queue initialization errors
+            pass
+    
+    logging.handlers.QueueHandler.__init__ = patched_queue_handler_init
+    
+    # Suppress all multiprocessing-related warnings
+    warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
+    warnings.filterwarnings('ignore', category=RuntimeWarning, module='multiprocessing')
+    warnings.filterwarnings('ignore', message='.*EOFError.*')
+    warnings.filterwarnings('ignore', message='.*multiprocessing.*')
+    warnings.filterwarnings('ignore', message='.*logging.*')
+    warnings.filterwarnings('ignore', message='.*semaphore_tracker.*')
+    
+    # Set multiprocessing logger to CRITICAL only (effectively disabled)
+    mp_logger = logging.getLogger('multiprocessing')
+    mp_logger.setLevel(logging.CRITICAL)
+    mp_logger.handlers.clear()
+    mp_logger.propagate = False
+    
+    # Remove any QueueHandlers from root logger
+    for handler in logging.root.handlers[:]:
+        if isinstance(handler, logging.handlers.QueueHandler):
+            logging.root.removeHandler(handler)
+
+# Apply the patch immediately
+_patch_multiprocessing_logging()
+
+# ============================================================================
+# Now safe to import multiprocessing
+# ============================================================================
 import multiprocessing as mp
 
 # ============================================================================
-# CRITICAL: Multiprocessing Setup - MUST BE FIRST
+# CRITICAL: Multiprocessing Setup - MUST BE AFTER LOGGING PATCH
 # ============================================================================
 
 if __name__ == "__main__":
@@ -55,49 +139,6 @@ if __name__ == "__main__":
         pass  # Already set
 
 # ============================================================================
-# FIX: Disable multiprocessing logging BEFORE any other imports
-# ============================================================================
-import logging
-import warnings
-
-# CRITICAL: Disable all multiprocessing logging to prevent EOFError
-logging.logMultiprocessing = False
-logging.logProcesses = False
-logging.logThreads = False
-
-# Completely disable the QueueHandler/QueueListener mechanism
-import logging.handlers
-_original_queue_handler_init = logging.handlers.QueueHandler.__init__
-
-def _patched_queue_handler_init(self, queue):
-    """Patched QueueHandler that doesn't use multiprocessing queues"""
-    try:
-        _original_queue_handler_init(self, queue)
-    except (EOFError, OSError, ValueError):
-        # Silently ignore queue errors
-        pass
-
-logging.handlers.QueueHandler.__init__ = _patched_queue_handler_init
-
-# Suppress all multiprocessing warnings
-warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
-warnings.filterwarnings('ignore', message='.*EOFError.*')
-warnings.filterwarnings('ignore', message='.*multiprocessing.*')
-warnings.filterwarnings('ignore', message='.*logging.*')
-
-# Set multiprocessing logger to CRITICAL only (effectively disabled)
-mp_logger = logging.getLogger('multiprocessing')
-mp_logger.setLevel(logging.CRITICAL)
-mp_logger.handlers.clear()
-mp_logger.propagate = False
-
-# Also disable the root logger's handlers for multiprocessing
-for handler in logging.root.handlers[:]:
-    if isinstance(handler, logging.handlers.QueueHandler):
-        logging.root.removeHandler(handler)
-
-
-# ============================================================================
 # Standard Imports
 # ============================================================================
 import math
@@ -111,16 +152,10 @@ import shutil
 import base64
 import hashlib
 import time
-import logging
-import warnings
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from asyncio import Lock
-
-# Suppress multiprocessing warnings
-logging.getLogger('multiprocessing').setLevel(logging.ERROR)
-warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
 
 from dotenv import load_dotenv
 import bittensor as bt
@@ -202,30 +237,6 @@ try:
 except ImportError:
     bt.logging.warning("gpu_memory_manager not available, using basic memory management")
     GPU_MEMORY_MANAGER_AVAILABLE = False
-
-# ============================================================================
-# Suppress Multiprocessing Logging Errors
-# ============================================================================
-
-import logging
-import warnings
-from logging.handlers import QueueHandler, QueueListener
-
-# Disable multiprocessing queue logging to prevent EOFError
-logging.logMultiprocessing = False
-logging.logProcesses = False
-logging.logThreads = False
-
-# Suppress all multiprocessing warnings
-warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
-warnings.filterwarnings('ignore', message='.*EOFError.*')
-warnings.filterwarnings('ignore', message='.*multiprocessing.*')
-
-# Set multiprocessing logger to ERROR only
-mp_logger = logging.getLogger('multiprocessing')
-mp_logger.setLevel(logging.ERROR)
-mp_logger.handlers.clear()
-mp_logger.propagate = False
 
 # ============================================================================
 # CONSTANTS
@@ -835,8 +846,7 @@ async def process_iteration(
             mutation_prob,
             seen_inchikeys,
             component_weights_dict,
-            # True,  # ← ENABLE MULTIPROCESSING
-            False,  # ← DISABLE MULTIPROCESSING
+            True,  # ← ENABLE MULTIPROCESSING (fixed from False)
             None   # ← n_workers (None = auto-detect)
         )
         
