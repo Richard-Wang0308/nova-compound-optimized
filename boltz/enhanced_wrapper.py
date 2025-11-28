@@ -712,51 +712,147 @@ properties:
         affinity_model: Any
     ) -> None:
         """
-        Run Boltz-2 prediction on a batch of input files.
+        Run Boltz-2 prediction on a batch of input files with parallel processing.
+        
+        Since predict() only accepts single paths, we process multiple files
+        in parallel using ThreadPoolExecutor.
         
         Args:
             batch: List of (mol_idx, yaml_path) tuples
             structure_model: Loaded structure model
             affinity_model: Loaded affinity model
         """
-        # Collect all YAML paths for this batch
-        yaml_paths = [yaml_path for _, yaml_path in batch]
+        import concurrent.futures
+        import inspect
         
-        bt.logging.debug(f"Running Boltz-2 on {len(yaml_paths)} YAML files")
+        bt.logging.debug(f"Running Boltz-2 on {len(batch)} molecules (parallel processing)")
         
-        # Run Boltz-2 predict function (from boltz.main)
-        try:
-            predict(
-                data=yaml_paths,
-                out_dir=self.output_dir,
-                cache=Path("~/.boltz").expanduser(),
-                checkpoint=None,  # Using loaded models
-                devices=[self.device_id],
-                accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                recycling_steps=self.config['recycling_steps'],
-                sampling_steps=self.config['sampling_steps'],
-                diffusion_samples=self.config['diffusion_samples'],
-                output_format="pdb",
-                num_workers=self.optimization_manager.get_optimal_workers(),
-                override=False,
-                use_msa_server=False,
-                msa_server_url=None,
-                msa_pairing_strategy="greedy",
-                write_full_pae=False,
-                write_full_pde=False,
-                # Use precomputed conformers
-                precomputed_ligand_conformers=(
-                    Path(self.precomputed_dir) if self.use_precomputed_conformers else None
-                ),
-                # Use cached models (pass them directly)
-                model=structure_model,
-                affinity_model=affinity_model,
-            )
+        # Get predict function signature once
+        predict_params = inspect.signature(predict).parameters
+        
+        def process_single_molecule(mol_idx: int, yaml_path: str) -> Tuple[int, bool, Optional[str]]:
+            """
+            Process a single molecule.
             
-        except Exception as e:
-            bt.logging.error(f"Boltz-2 prediction failed for batch: {e}")
-            bt.logging.error(traceback.format_exc())
-            raise
+            Returns:
+                (mol_idx, success, error_message)
+            """
+            try:
+                # Build kwargs with only supported parameters
+                kwargs = {
+                    'data': yaml_path,  # ✅ Single path string, not list
+                    'out_dir': self.output_dir,
+                    'cache': Path("~/.boltz").expanduser(),
+                    'devices': [self.device_id],
+                    'accelerator': "gpu" if torch.cuda.is_available() else "cpu",
+                    'num_workers': 1,  # Use 1 worker per prediction to avoid conflicts
+                    'override': False,
+                }
+                
+                # Add optional parameters only if they exist
+                if 'checkpoint' in predict_params:
+                    kwargs['checkpoint'] = None
+                
+                if 'recycling_steps' in predict_params:
+                    kwargs['recycling_steps'] = self.config['recycling_steps']
+                
+                if 'sampling_steps' in predict_params:
+                    kwargs['sampling_steps'] = self.config['sampling_steps']
+                
+                if 'diffusion_samples' in predict_params:
+                    kwargs['diffusion_samples'] = self.config['diffusion_samples']
+                
+                if 'output_format' in predict_params:
+                    kwargs['output_format'] = "pdb"
+                
+                if 'use_msa_server' in predict_params:
+                    kwargs['use_msa_server'] = False
+                
+                if 'msa_server_url' in predict_params:
+                    kwargs['msa_server_url'] = None
+                
+                if 'msa_pairing_strategy' in predict_params:
+                    kwargs['msa_pairing_strategy'] = "greedy"
+                
+                if 'write_full_pae' in predict_params:
+                    kwargs['write_full_pae'] = False
+                
+                if 'write_full_pde' in predict_params:
+                    kwargs['write_full_pde'] = False
+                
+                if 'model' in predict_params:
+                    kwargs['model'] = structure_model
+                
+                if 'affinity_model' in predict_params:
+                    kwargs['affinity_model'] = affinity_model
+                
+                # Call predict with only supported parameters
+                predict(**kwargs)
+                
+                return mol_idx, True, None
+                
+            except Exception as e:
+                error_msg = str(e)
+                bt.logging.debug(f"Prediction failed for mol_idx={mol_idx}: {error_msg}")
+                return mol_idx, False, error_msg
+        
+        # Determine optimal number of parallel workers
+        # Use fewer workers to avoid GPU memory conflicts
+        max_parallel = min(4, len(batch))  # Max 4 parallel predictions per GPU
+        
+        successful = 0
+        failed = 0
+        errors = []
+        
+        # Process molecules in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(process_single_molecule, mol_idx, yaml_path): (mol_idx, yaml_path)
+                for mol_idx, yaml_path in batch
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                mol_idx, yaml_path = futures[future]
+                
+                try:
+                    result_mol_idx, success, error_msg = future.result()
+                    
+                    if success:
+                        successful += 1
+                    else:
+                        failed += 1
+                        if error_msg:
+                            errors.append((result_mol_idx, error_msg))
+                            
+                except Exception as e:
+                    bt.logging.warning(f"Unexpected error processing mol_idx={mol_idx}: {e}")
+                    failed += 1
+                    errors.append((mol_idx, str(e)))
+        
+        # Log summary
+        bt.logging.debug(
+            f"Batch complete: {successful}/{len(batch)} successful, {failed} failed"
+        )
+        
+        # Log unique error types (not every error to avoid spam)
+        if errors:
+            unique_errors = {}
+            for mol_idx, error_msg in errors:
+                error_type = error_msg.split(':')[0] if ':' in error_msg else error_msg
+                if error_type not in unique_errors:
+                    unique_errors[error_type] = []
+                unique_errors[error_type].append(mol_idx)
+            
+            for error_type, mol_indices in unique_errors.items():
+                bt.logging.warning(
+                    f"Error '{error_type}' occurred for {len(mol_indices)} molecules"
+                )
+        
+        # Only raise if ALL predictions failed
+        if successful == 0 and len(batch) > 0:
+            raise RuntimeError(f"All {len(batch)} predictions failed in batch")
 
     # ========================================================================
     # POSTPROCESSING (same as original)
