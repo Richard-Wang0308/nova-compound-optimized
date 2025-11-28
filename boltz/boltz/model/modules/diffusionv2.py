@@ -199,8 +199,11 @@ class AtomDiffusion(Module):
         synchronize_sigmas: bool = False,
     ):
         super().__init__()
+        # Filter out unsupported parameters
+        filtered_args = {k: v for k, v in score_model_args.items() if k != 'offload_to_cpu'}
+        
         self.score_model = DiffusionModule(
-            **score_model_args,
+            **filtered_args,  # ← Use filtered args
         )
         if compile_score:
             self.score_model = torch.compile(

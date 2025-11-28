@@ -271,6 +271,11 @@ class Boltz2(LightningModule):
             use_residue_feats_atoms=use_residue_feats_atoms,
         )
 
+        # Filter out unsupported parameters from score_model_args
+        filtered_score_model_args = {
+            k: v for k, v in score_model_args.items() 
+            if k not in ['offload_to_cpu']
+        }
         # Output modules
         self.structure_module = AtomDiffusion(
             score_model_args={
@@ -278,7 +283,7 @@ class Boltz2(LightningModule):
                 "atom_s": atom_s,
                 "atoms_per_window_queries": atoms_per_window_queries,
                 "atoms_per_window_keys": atoms_per_window_keys,
-                **score_model_args,
+                **filtered_score_model_args,
             },
             compile_score=compile_structure,
             **diffusion_process_args,

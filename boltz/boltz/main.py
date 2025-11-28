@@ -70,7 +70,7 @@ class PairformerArgs:
     num_heads: int = 16
     dropout: float = 0.0
     activation_checkpointing: bool = False
-    offload_to_cpu: bool = False
+    # offload_to_cpu: bool = False
     v2: bool = False
 
 
@@ -82,7 +82,7 @@ class PairformerArgsV2:
     num_heads: int = 16
     dropout: float = 0.0
     activation_checkpointing: bool = False
-    offload_to_cpu: bool = False
+    # offload_to_cpu: bool = False
     v2: bool = True
 
 
@@ -98,7 +98,7 @@ class MSAModuleArgs:
     pairwise_head_width: int = 32
     pairwise_num_heads: int = 4
     activation_checkpointing: bool = False
-    offload_to_cpu: bool = False
+    # offload_to_cpu: bool = False
     subsample_msa: bool = False
     num_subsampled_msa: int = 1024
 

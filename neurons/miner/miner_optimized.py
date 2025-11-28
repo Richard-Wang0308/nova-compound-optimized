@@ -21,6 +21,8 @@ All critical bugs fixed:
 - Optimized block queries (caching)
 - Added comprehensive timing tracking
 - Fixed multiprocessing module import issues
+- Fixed WebSocket concurrency errors (thread-safe subtensor access)
+- Fixed metagraph.sync TypeError
 """
 
 import os
@@ -52,6 +54,48 @@ if __name__ == "__main__":
     except RuntimeError:
         pass  # Already set
 
+# ============================================================================
+# FIX: Disable multiprocessing logging BEFORE any other imports
+# ============================================================================
+import logging
+import warnings
+
+# CRITICAL: Disable all multiprocessing logging to prevent EOFError
+logging.logMultiprocessing = False
+logging.logProcesses = False
+logging.logThreads = False
+
+# Completely disable the QueueHandler/QueueListener mechanism
+import logging.handlers
+_original_queue_handler_init = logging.handlers.QueueHandler.__init__
+
+def _patched_queue_handler_init(self, queue):
+    """Patched QueueHandler that doesn't use multiprocessing queues"""
+    try:
+        _original_queue_handler_init(self, queue)
+    except (EOFError, OSError, ValueError):
+        # Silently ignore queue errors
+        pass
+
+logging.handlers.QueueHandler.__init__ = _patched_queue_handler_init
+
+# Suppress all multiprocessing warnings
+warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
+warnings.filterwarnings('ignore', message='.*EOFError.*')
+warnings.filterwarnings('ignore', message='.*multiprocessing.*')
+warnings.filterwarnings('ignore', message='.*logging.*')
+
+# Set multiprocessing logger to CRITICAL only (effectively disabled)
+mp_logger = logging.getLogger('multiprocessing')
+mp_logger.setLevel(logging.CRITICAL)
+mp_logger.handlers.clear()
+mp_logger.propagate = False
+
+# Also disable the root logger's handlers for multiprocessing
+for handler in logging.root.handlers[:]:
+    if isinstance(handler, logging.handlers.QueueHandler):
+        logging.root.removeHandler(handler)
+
 
 # ============================================================================
 # Standard Imports
@@ -69,6 +113,7 @@ import hashlib
 import time
 import logging
 import warnings
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from asyncio import Lock
@@ -208,6 +253,64 @@ DEFAULT_ELITE_FRAC = 0.25
 
 # Cache warming constants
 CACHE_WARMUP_SAMPLES = 2000
+
+# ============================================================================
+# THREAD-SAFE BLOCK CACHING
+# ============================================================================
+
+async def get_cached_block(state: Dict[str, Any], cache_duration: int = 12) -> int:
+    """
+    Get block number with caching to avoid concurrent WebSocket calls.
+    
+    Args:
+        state: Global state dictionary
+        cache_duration: Cache validity in seconds
+    
+    Returns:
+        Current block number
+    """
+    current_time = time.time()
+    
+    # Initialize cache if needed
+    if 'block_cache' not in state:
+        state['block_cache'] = {'block': None, 'timestamp': 0}
+    
+    if 'block_lock' not in state:
+        state['block_lock'] = asyncio.Lock()
+    
+    cache = state['block_cache']
+    
+    # Return cached value if still valid
+    if cache['block'] and (current_time - cache['timestamp']) < cache_duration:
+        return cache['block']
+    
+    # Update cache with new block number
+    try:
+        async with state['block_lock']:
+            # Double-check after acquiring lock
+            if cache['block'] and (current_time - cache['timestamp']) < cache_duration:
+                return cache['block']
+            
+            # Get new block number in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            block = await loop.run_in_executor(
+                state.get('sync_executor'),
+                state['subtensor'].get_current_block
+            )
+            
+            cache['block'] = block
+            cache['timestamp'] = current_time
+            state['last_known_block'] = block
+            return block
+    
+    except Exception as e:
+        bt.logging.warning(f"Could not fetch current block: {e}")
+        # Return cached value if available, even if expired
+        if cache['block']:
+            return cache['block']
+        # Fallback to last known block
+        return state.get('last_known_block', 0)
+
 
 # ============================================================================
 # CONFIG & ARGUMENT PARSING
@@ -488,7 +591,12 @@ async def submission_monitor(state: Dict[str, Any]) -> None:
     while not state['shutdown_event'].is_set():
         try:
             # Use cached block to avoid network calls
-            current_block = state.get('cached_block', state['subtensor'].get_current_block())
+            current_block = await get_cached_block(state)
+            if current_block == 0:
+                # If no cached block available, skip this iteration
+                await asyncio.sleep(2)
+                continue
+            
             next_epoch = ((current_block // state['epoch_length']) + 1) * state['epoch_length']
             blocks_remaining = next_epoch - current_block
             
@@ -535,7 +643,7 @@ async def update_top_pool(
         'boltz_score': scores
     })
     
-    # FIX: Single atomic update with lock
+    # Single atomic update with lock
     async with state['pool_lock']:
         current_pool = state.get('boltz_top_pool', pd.DataFrame())
         
@@ -618,7 +726,7 @@ async def run_optimized_pipeline_with_caching(state: Dict[str, Any]) -> None:
             
             # Save SMILES cache periodically
             if iteration % 20 == 0:
-                # FIX: Run in executor to avoid blocking
+                # Run in executor to avoid blocking
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     state.get('file_io_executor'),
@@ -655,8 +763,8 @@ async def process_iteration(
         ram_manager = state.get('ram_manager')
         elite_optimizer = state.get('elite_optimizer')
         
-        # FIX: Check deadline before expensive operations
-        current_block = state.get('cached_block', state['subtensor'].get_current_block())
+        # Check deadline before expensive operations
+        current_block = await get_cached_block(state)
         next_epoch = ((current_block // state['epoch_length']) + 1) * state['epoch_length']
         blocks_remaining = next_epoch - current_block
         
@@ -728,7 +836,7 @@ async def process_iteration(
             seen_inchikeys,
             component_weights_dict,
             # True,  # ← ENABLE MULTIPROCESSING
-            False,
+            False,  # ← DISABLE MULTIPROCESSING
             None   # ← n_workers (None = auto-detect)
         )
         
@@ -879,7 +987,7 @@ async def process_iteration(
         
         bt.logging.info(f"Scored {len(all_names)} molecules in {inference_elapsed:.2f}s ({len(all_names)/inference_elapsed:.1f} mol/s)")
         
-        # FIX: Single atomic pool update (not per-GPU)
+        # Single atomic pool update (not per-GPU)
         await update_top_pool(state, all_names, all_smiles, all_scores, ram_manager)
     
     finally:
@@ -1051,7 +1159,7 @@ async def submit_response(state: Dict[str, Any]) -> None:
 
     bt.logging.info(f"🚀 Starting submission for: {candidate_product}")
     
-    current_block = state.get('cached_block', state['subtensor'].get_current_block())
+    current_block = await get_cached_block(state)
     encrypted_response = state['bdt'].encrypt(state['miner_uid'], candidate_product, current_block)
     bt.logging.info(f"Encrypted response generated")
 
@@ -1132,27 +1240,28 @@ async def main_epoch_loop(state: Dict[str, Any]) -> None:
     config = state['config']
     
     last_cache_save = time.time()
-    last_block_update = 0
-    cached_block = 0
+    last_metagraph_sync = 0
     
     while True:
         try:
             current_time = time.time()
             
-            # FIX: Update block cache periodically (not every iteration)
-            if current_time - last_block_update >= BLOCK_CACHE_UPDATE_INTERVAL:
-                cached_block = subtensor.get_current_block()
-                last_block_update = current_time
-                state['cached_block'] = cached_block
-            else:
-                cached_block = state.get('cached_block', subtensor.get_current_block())
+            # Use cached block function
+            cached_block = await get_cached_block(state)
             
             if cached_block % epoch_length == 0:
                 bt.logging.info(f"{'='*60}")
                 bt.logging.info(f"🔄 EPOCH BOUNDARY at block {cached_block}")
                 bt.logging.info(f"{'='*60}")
                 
-                block_hash = subtensor.get_block_hash(cached_block)
+                # Get block hash in executor
+                loop = asyncio.get_event_loop()
+                block_hash = await loop.run_in_executor(
+                    state.get('sync_executor'),
+                    subtensor.get_block_hash,
+                    cached_block
+                )
+                
                 new_proteins = get_challenge_params_from_blockhash(
                     block_hash=block_hash,
                     weekly_target=config.weekly_target,
@@ -1206,7 +1315,7 @@ async def main_epoch_loop(state: Dict[str, Any]) -> None:
                 
                 log_cache_statistics(state)
             
-            # FIX: Save cache in executor (non-blocking)
+            # Save cache in executor (non-blocking)
             if time.time() - last_cache_save > CACHE_SAVE_INTERVAL:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
@@ -1216,14 +1325,14 @@ async def main_epoch_loop(state: Dict[str, Any]) -> None:
                 last_cache_save = time.time()
                 bt.logging.debug("Cache saved to disk")
             
-            # FIX: Sync metagraph in executor (non-blocking)
-            if cached_block % METAGRAPH_SYNC_INTERVAL == 0:
+            # Sync metagraph in executor (non-blocking)
+            if cached_block - last_metagraph_sync >= METAGRAPH_SYNC_INTERVAL:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     state.get('sync_executor'),
-                    metagraph.sync,
-                    subtensor
+                    lambda: metagraph.sync(subtensor=subtensor)
                 )
+                last_metagraph_sync = cached_block
                 bt.logging.info(
                     f"Block: {cached_block} | "
                     f"Epoch: {cached_block // epoch_length} | "
@@ -1236,7 +1345,7 @@ async def main_epoch_loop(state: Dict[str, Any]) -> None:
             bt.logging.info("🛑 Shutting down miner...")
             state['shutdown_event'].set()
             
-            # FIX: Graceful shutdown with shield
+            # Graceful shutdown with shield
             if 'inference_task' in state and state['inference_task']:
                 if not state['inference_task'].done():
                     try:
@@ -1261,7 +1370,7 @@ async def main_epoch_loop(state: Dict[str, Any]) -> None:
                 except asyncio.CancelledError:
                     bt.logging.info("Submission monitor stopped")
             
-            # FIX: Shutdown all executors
+            # Shutdown all executors
             executors_to_shutdown = [
                 ('molecule_gen_executor', "Molecule generator"),
                 ('boltz_executor', "Boltz"),
@@ -1455,6 +1564,7 @@ async def run_miner_optimized(config: argparse.Namespace) -> None:
         
         # Block caching
         'cached_block': 0,
+        'last_known_block': 0,
         
         # BDT
         'bdt': QuicknetBittensorDrandTimelock(),
@@ -1462,10 +1572,17 @@ async def run_miner_optimized(config: argparse.Namespace) -> None:
     }
     
     # Get initial proteins
-    current_block = subtensor.get_current_block()
+    current_block = await get_cached_block(state)
     state['cached_block'] = current_block
     last_boundary = (current_block // epoch_length) * epoch_length
-    block_hash = subtensor.get_block_hash(last_boundary)
+    
+    # Get block hash in executor
+    loop = asyncio.get_event_loop()
+    block_hash = await loop.run_in_executor(
+        state['sync_executor'],
+        subtensor.get_block_hash,
+        last_boundary
+    )
     
     startup_proteins = get_challenge_params_from_blockhash(
         block_hash=block_hash,
