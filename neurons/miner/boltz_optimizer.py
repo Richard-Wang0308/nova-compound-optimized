@@ -11,6 +11,7 @@ from collections import deque
 from threading import Lock
 import torch
 import psutil
+import gc
 import bittensor as bt
 
 
@@ -322,6 +323,7 @@ class BoltzOptimizationManager:
     - Mixed precision
     - Performance tracking
     - Adaptive workers
+    - Dynamic batching
     """
     
     def __init__(
@@ -332,10 +334,20 @@ class BoltzOptimizationManager:
         max_workers: int = 4,
         target_vram_utilization: float = 0.85,
         max_ram_usage: float = 0.85,
-        enable_monitoring: bool = True
+        enable_monitoring: bool = True,
+        # NEW: Batching parameters
+        target_batch_size: int = 8,
+        enable_dynamic_batching: bool = True,
+        enable_mixed_precision: bool = True,
+        enable_memory_optimization: bool = True
     ):
         self.device_id = device_id
         self.enable_monitoring = enable_monitoring
+        
+        # NEW: Store batching configuration
+        self.target_batch_size = target_batch_size
+        self.enable_dynamic_batching = enable_dynamic_batching
+        self.enable_memory_optimization = enable_memory_optimization
         
         # Initialize components
         self.vram_monitor = VRAMMonitor(device_id, target_vram_utilization)
@@ -345,12 +357,19 @@ class BoltzOptimizationManager:
             base_workers, max_workers, max_ram_usage, device_id
         )
         
+        # NEW: Initialize dynamic batch size tracker
+        self.current_batch_size = target_batch_size
+        self.min_batch_size = max(1, target_batch_size // 4)
+        self.max_batch_size = target_batch_size * 2
+        
         bt.logging.info("="*60)
         bt.logging.info(f"BoltzOptimizationManager initialized (GPU {device_id})")
         bt.logging.info(f"  Quantization: {quantization}")
         bt.logging.info(f"  Mixed precision: {self.mixed_precision.use_mixed_precision}")
         bt.logging.info(f"  Base workers: {base_workers} (max: {max_workers})")
         bt.logging.info(f"  VRAM monitoring: {enable_monitoring}")
+        bt.logging.info(f"  Batch size: {target_batch_size} (dynamic: {enable_dynamic_batching})")
+        bt.logging.info(f"  Batch size range: {self.min_batch_size}-{self.max_batch_size}")
         bt.logging.info("="*60)
     
     def get_optimal_workers(self) -> int:
@@ -363,6 +382,75 @@ class BoltzOptimizationManager:
         """Get precision string for PyTorch Lightning."""
         return self.mixed_precision.get_lightning_precision()
     
+    def get_optimal_batch_size(self) -> int:
+        """
+        Get optimal batch size based on current VRAM usage.
+        
+        Returns:
+            Optimal batch size for current conditions
+        """
+        if not self.enable_dynamic_batching:
+            return self.target_batch_size
+        
+        # Check current VRAM usage
+        if self.enable_monitoring:
+            vram_info = self.vram_monitor.get_memory_stats()
+            vram_usage = vram_info.get('utilization', 0.0)
+            
+            # Adjust batch size based on VRAM pressure
+            if vram_usage > 0.90:
+                # High pressure - reduce batch size
+                self.current_batch_size = max(
+                    self.min_batch_size,
+                    self.current_batch_size // 2
+                )
+                bt.logging.warning(
+                    f"High VRAM usage ({vram_usage:.1%}), "
+                    f"reducing batch size to {self.current_batch_size}"
+                )
+            elif vram_usage < 0.60 and self.current_batch_size < self.max_batch_size:
+                # Low pressure - can increase batch size
+                self.current_batch_size = min(
+                    self.max_batch_size,
+                    int(self.current_batch_size * 1.5)
+                )
+                bt.logging.debug(
+                    f"Low VRAM usage ({vram_usage:.1%}), "
+                    f"increasing batch size to {self.current_batch_size}"
+                )
+        
+        return self.current_batch_size
+    
+    def prepare_batch(self, items: List[Any], max_batch_size: Optional[int] = None) -> List[List[Any]]:
+        """
+        Split items into optimally-sized batches.
+        
+        Args:
+            items: List of items to batch
+            max_batch_size: Override batch size (optional)
+        
+        Returns:
+            List of batches
+        """
+        batch_size = max_batch_size or self.get_optimal_batch_size()
+        
+        batches = []
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            batches.append(batch)
+        
+        bt.logging.debug(
+            f"Split {len(items)} items into {len(batches)} batches "
+            f"(size={batch_size})"
+        )
+        
+        return batches
+    
+    def reset_batch_size(self):
+        """Reset batch size to target value."""
+        self.current_batch_size = self.target_batch_size
+        bt.logging.debug(f"Batch size reset to {self.target_batch_size}")
+    
     def record_batch_processing(self, num_molecules: int, elapsed_time: float):
         """Record batch processing metrics."""
         self.performance_monitor.record_batch(num_molecules, elapsed_time)
@@ -373,8 +461,10 @@ class BoltzOptimizationManager:
         self.performance_monitor.record_oom()
     
     def clear_gpu_cache(self):
-        """Clear GPU cache."""
-        self.vram_monitor.clear_cache()
+        """Clear GPU cache and run garbage collection."""
+        if self.enable_memory_optimization:
+            self.vram_monitor.clear_cache()
+            gc.collect()
     
     def get_memory_stats(self) -> Dict[str, float]:
         """Get current GPU memory statistics."""
@@ -406,10 +496,12 @@ def create_optimization_managers(
     quantization: str = 'none',
     base_workers: int = 4,
     max_workers: int = 4,
-    enable_monitoring: bool = True
+    enable_monitoring: bool = True,
+    target_batch_size: int = 8,
+    enable_dynamic_batching: bool = True
 ) -> Dict[int, BoltzOptimizationManager]:
     """
-    Create optimization managers for all GPUs.
+    Create optimization managers for all GPUs with adaptive batch sizing.
     
     Args:
         num_gpus: Number of GPUs (None = all available)
@@ -417,6 +509,8 @@ def create_optimization_managers(
         base_workers: Base number of DataLoader workers
         max_workers: Maximum number of workers (capped at 4)
         enable_monitoring: Enable resource monitoring
+        target_batch_size: Target batch size (will be auto-adjusted per GPU)
+        enable_dynamic_batching: Enable dynamic batch size adjustment
     
     Returns:
         Dictionary mapping GPU ID to BoltzOptimizationManager
@@ -430,12 +524,39 @@ def create_optimization_managers(
     
     managers = {}
     for gpu_id in range(num_gpus):
+        # Determine optimal batch size based on GPU memory
+        if torch.cuda.is_available():
+            gpu_memory_gb = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+            
+            # Adaptive batch sizing
+            if gpu_memory_gb >= 40:  # A100, H100
+                optimal_batch_size = 32
+            elif gpu_memory_gb >= 24:  # RTX 3090, 4090, A5000
+                optimal_batch_size = 16
+            elif gpu_memory_gb >= 16:  # RTX 4080, A4000
+                optimal_batch_size = 12
+            elif gpu_memory_gb >= 12:  # RTX 3080, 4070
+                optimal_batch_size = 8
+            else:  # Smaller GPUs
+                optimal_batch_size = 4
+            
+            bt.logging.info(
+                f"GPU {gpu_id}: {gpu_memory_gb:.1f}GB detected, "
+                f"using batch_size={optimal_batch_size}"
+            )
+        else:
+            optimal_batch_size = target_batch_size
+        
         manager = BoltzOptimizationManager(
             device_id=gpu_id,
             quantization=quantization,
             base_workers=base_workers,
             max_workers=max_workers,
-            enable_monitoring=enable_monitoring
+            enable_monitoring=enable_monitoring,
+            target_batch_size=optimal_batch_size,
+            enable_dynamic_batching=enable_dynamic_batching,
+            enable_mixed_precision=True,
+            enable_memory_optimization=True
         )
         managers[gpu_id] = manager
         

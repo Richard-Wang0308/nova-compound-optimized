@@ -18,7 +18,7 @@ import math
 import psutil
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Environment setup (same as original)
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
@@ -136,6 +136,9 @@ class EnhancedBoltzWrapper:
         self.base_dir = BASE_DIR
         self.device_id = device_id
         
+        # NEW: Initialize subnet_config (will be set by validator)
+        self.subnet_config = None
+        
         # Setup directories
         self.tmp_dir = os.path.join(PARENT_DIR, "boltz_tmp_files")
         os.makedirs(self.tmp_dir, exist_ok=True)
@@ -154,18 +157,60 @@ class EnhancedBoltzWrapper:
         bt.logging.debug(f"EnhancedBoltzWrapper initialized with device_id={device_id}")
         
         # ═══════════════════════════════════════════════════════════
-        # NEW: Initialize BoltzOptimizationManager
+        # FIXED: Initialize BoltzOptimizationManager with proper batching
         # ═══════════════════════════════════════════════════════════
+        
+        # Determine optimal batch size based on GPU memory
+        if torch.cuda.is_available():
+            gpu_memory_gb = torch.cuda.get_device_properties(device_id).total_memory / 1e9
+            
+            # Adaptive batch sizing based on GPU memory
+            if gpu_memory_gb >= 40:  # A100, H100
+                optimal_batch_size = 32
+                num_workers = 8
+            elif gpu_memory_gb >= 24:  # RTX 3090, 4090, A5000
+                optimal_batch_size = 16
+                num_workers = 6
+            elif gpu_memory_gb >= 16:  # RTX 4080, A4000
+                optimal_batch_size = 12
+                num_workers = 4
+            elif gpu_memory_gb >= 12:  # RTX 3080, 4070
+                optimal_batch_size = 8
+                num_workers = 4
+            else:  # Smaller GPUs
+                optimal_batch_size = 4
+                num_workers = 2
+            
+            bt.logging.info(f"GPU {device_id}: {gpu_memory_gb:.1f}GB detected, using batch_size={optimal_batch_size}")
+        else:
+            optimal_batch_size = 4
+            num_workers = 2
+            bt.logging.warning("No GPU detected, using CPU with small batch size")
+        
+        # Override with config if specified
+        config_batch_size = self.config.get('batch_size', None)
+        if config_batch_size is not None:
+            optimal_batch_size = config_batch_size
+            bt.logging.info(f"Using config-specified batch_size={optimal_batch_size}")
+        
         self.optimization_manager = BoltzOptimizationManager(
             device_id=device_id,
             quantization=self.config.get('quantization', 'none'),
-            base_workers=self.config.get('num_workers', 4),
-            max_workers=4,
-            target_vram_utilization=self.config.get('max_gpu_memory_usage', 0.90),
+            base_workers=self.config.get('num_workers', num_workers),
+            max_workers=num_workers,
+            target_vram_utilization=self.config.get('max_gpu_memory_usage', 0.85),  # Reduced from 0.90
             max_ram_usage=self.config.get('max_ram_usage', 0.85),
-            enable_monitoring=self.config.get('enable_memory_monitoring', True)
+            enable_monitoring=self.config.get('enable_memory_monitoring', True),
+            # NEW: Add batch size configuration
+            target_batch_size=optimal_batch_size,
+            enable_dynamic_batching=True,
+            enable_mixed_precision=True,
+            enable_memory_optimization=True
         )
-        bt.logging.info("✓ BoltzOptimizationManager initialized")
+        bt.logging.info(f"✓ BoltzOptimizationManager initialized (batch_size={optimal_batch_size}, workers={num_workers})")
+        
+        # Store batch size for later use
+        self.batch_size = optimal_batch_size
         
         # ═══════════════════════════════════════════════════════════
         # NEW: Initialize ResidentModelManager
@@ -186,7 +231,7 @@ class EnhancedBoltzWrapper:
         
         self._rng0 = _snapshot_rng()
         bt.logging.debug("EnhancedBoltzWrapper initialized with deterministic baseline")
-    
+
     # ========================================================================
     # MODEL LOADING (using ResidentModelManager)
     # ========================================================================
@@ -269,7 +314,7 @@ class EnhancedBoltzWrapper:
         cache.mkdir(parents=True, exist_ok=True)
         
         # Download models if they don't exist
-        # self._download_models_if_needed(cache)
+        self._download_models_if_needed(cache)
         
         # ───────────────────────────────────────────────────────────
         # Load structure model using model manager
@@ -547,159 +592,172 @@ properties:
         return yaml_content
     
     # ========================================================================
-    # MAIN SCORING METHOD (enhanced with monitoring)
+    # MAIN SCORING METHOD (enhanced with batching)
     # ========================================================================
     
     def score_molecules_target(
         self,
         valid_molecules_by_uid: dict,
         score_dict: dict,
-        subnet_config: dict,
-        final_block_hash: str
+        final_block_hash: str,
+        subnet_config: dict
     ) -> None:
         """
-        Score molecules with enhanced monitoring and optimization.
+        Score molecules using Boltz-2 with batching support.
         
-        This is the main entry point called by the miner.
+        Args:
+            valid_molecules_by_uid: {uid: {'smiles': [...], 'names': [...]}}
+            score_dict: Output dictionary for scores
+            final_block_hash: Block hash for determinism
+            subnet_config: Subnet configuration
         """
+        # Store subnet config
         self.subnet_config = subnet_config
         
-        # ═══════════════════════════════════════════════════════════
-        # STEP 1: PREPROCESS
-        # ═══════════════════════════════════════════════════════════
-        preprocess_start = time.time()
-        self.preprocess_data_for_boltz(valid_molecules_by_uid, score_dict, final_block_hash)
-        preprocess_time = time.time() - preprocess_start
-        bt.logging.debug(f"Preprocessing took {preprocess_time:.2f}s")
+        # Preprocess data (same as original)
+        self.preprocess_data_for_boltz(
+            valid_molecules_by_uid,
+            score_dict,
+            final_block_hash
+        )
         
-        # ═══════════════════════════════════════════════════════════
-        # STEP 2: LOAD MODELS (using ResidentModelManager)
-        # ═══════════════════════════════════════════════════════════
-        model_load_start = time.time()
+        if not self.unique_molecules:
+            bt.logging.warning("No molecules to score")
+            return
         
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.device_id)
-        
-        _restore_rng(self._rng0)
-        
+        # Load models
         structure_model, affinity_model = self._load_models_if_needed()
         
-        model_load_time = time.time() - model_load_start
-        bt.logging.debug(f"Model loading took {model_load_time:.2f}s")
-        
         # ═══════════════════════════════════════════════════════════
-        # STEP 3: ADJUST WORKERS (using BoltzOptimizationManager)
+        # NEW: Batch the prediction calls
         # ═══════════════════════════════════════════════════════════
-        num_workers = self.optimization_manager.get_optimal_workers()
+        all_input_files = []
+        for smiles, id_list in self.unique_molecules.items():
+            mol_idx = id_list[0][1]
+            yaml_path = os.path.join(self.input_dir, f"{mol_idx}.yaml")
+            all_input_files.append((mol_idx, yaml_path))
         
-        # Cap at 4 to avoid shared memory issues
-        num_workers = min(num_workers, 4)
+        # Split into batches
+        batches = self.optimization_manager.prepare_batch(all_input_files)
         
-        if num_workers > 0:
+        bt.logging.info(
+            f"Running Boltz-2 on {len(all_input_files)} molecules in {len(batches)} batches "
+            f"(batch_size={self.optimization_manager.current_batch_size})"
+        )
+        
+        total_start_time = time.time()
+        
+        # Process each batch
+        for batch_idx, batch in enumerate(batches, 1):
+            batch_start_time = time.time()
+            
             bt.logging.info(
-                f"Using {num_workers} DataLoader workers "
-                f"(capped at 4 to avoid shared memory issues)"
+                f"Processing batch {batch_idx}/{len(batches)} ({len(batch)} molecules)"
             )
-        else:
-            bt.logging.info("Using main process only (num_workers=0)")
+            
+            try:
+                # Run Boltz-2 on this batch
+                self._run_boltz_batch(
+                    batch,
+                    structure_model,
+                    affinity_model
+                )
+                
+                # Record performance
+                batch_elapsed = time.time() - batch_start_time
+                self.optimization_manager.record_batch_processing(
+                    len(batch),
+                    batch_elapsed
+                )
+                
+                bt.logging.info(
+                    f"✓ Batch {batch_idx}/{len(batches)} complete in {batch_elapsed:.2f}s "
+                    f"({len(batch)/batch_elapsed:.2f} mol/s)"
+                )
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    bt.logging.error(f"OOM in batch {batch_idx}")
+                    self.optimization_manager.record_oom_event()
+                else:
+                    bt.logging.error(f"Error in batch {batch_idx}: {e}")
+                    bt.logging.error(traceback.format_exc())
+            
+            except Exception as e:
+                bt.logging.error(f"Unexpected error in batch {batch_idx}: {e}")
+                bt.logging.error(traceback.format_exc())
+            
+            finally:
+                # Memory cleanup between batches
+                if self.optimization_manager.enable_memory_optimization:
+                    self.optimization_manager.clear_gpu_cache()
         
-        # ═══════════════════════════════════════════════════════════
-        # STEP 4: CHECK MEMORY BEFORE INFERENCE
-        # ═══════════════════════════════════════════════════════════
-        mem_stats = self.optimization_manager.get_memory_stats()
-        if mem_stats['utilization'] > 0.90:
-            bt.logging.warning(
-                f"GPU memory usage high ({mem_stats['utilization']:.1%}), "
-                "clearing cache..."
-            )
-            self.optimization_manager.clear_gpu_cache()
+        total_elapsed = time.time() - total_start_time
         
-        # ═══════════════════════════════════════════════════════════
-        # STEP 5: RUN BOLTZ-2 PREDICT
-        # ═══════════════════════════════════════════════════════════
-        bt.logging.info(f"Running Boltz2 on GPU {self.device_id}")
+        bt.logging.info(
+            f"✓ Boltz-2 inference complete in {total_elapsed:.2f}s "
+            f"({len(all_input_files)/total_elapsed:.2f} mol/s)"
+        )
         
-        inference_start = time.time()
+        # Postprocess results (same as original)
+        self.postprocess_data(score_dict)
         
+        # Log performance summary
+        self.optimization_manager.log_performance_summary()
+    
+    def _run_boltz_batch(
+        self,
+        batch: List[Tuple[int, str]],
+        structure_model: Any,
+        affinity_model: Any
+    ) -> None:
+        """
+        Run Boltz-2 prediction on a batch of input files.
+        
+        Args:
+            batch: List of (mol_idx, yaml_path) tuples
+            structure_model: Loaded structure model
+            affinity_model: Loaded affinity model
+        """
+        # Collect all YAML paths for this batch
+        yaml_paths = [yaml_path for _, yaml_path in batch]
+        
+        bt.logging.debug(f"Running Boltz-2 on {len(yaml_paths)} YAML files")
+        
+        # Run Boltz-2 predict function (from boltz.main)
         try:
             predict(
-                data=self.input_dir,
+                data=yaml_paths,
                 out_dir=self.output_dir,
+                cache=Path("~/.boltz").expanduser(),
+                checkpoint=None,  # Using loaded models
+                devices=[self.device_id],
+                accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 recycling_steps=self.config['recycling_steps'],
                 sampling_steps=self.config['sampling_steps'],
                 diffusion_samples=self.config['diffusion_samples'],
-                sampling_steps_affinity=self.config['sampling_steps_affinity'],
-                diffusion_samples_affinity=self.config['diffusion_samples_affinity'],
-                output_format=self.config['output_format'],
-                seed=68,
-                affinity_mw_correction=self.config['affinity_mw_correction'],
-                no_kernels=self.config['no_kernels'],
-                batch_predictions=self.config['batch_predictions'],
-                override=self.config['override'],
-                devices=[self.device_id],
-                num_workers=num_workers,
-                structure_model=structure_model,
+                output_format="pdb",
+                num_workers=self.optimization_manager.get_optimal_workers(),
+                override=False,
+                use_msa_server=False,
+                msa_server_url=None,
+                msa_pairing_strategy="greedy",
+                write_full_pae=False,
+                write_full_pde=False,
+                # Use precomputed conformers
+                precomputed_ligand_conformers=(
+                    Path(self.precomputed_dir) if self.use_precomputed_conformers else None
+                ),
+                # Use cached models (pass them directly)
+                model=structure_model,
                 affinity_model=affinity_model,
-                precomputed_conformers_dir=self.precomputed_dir if self.use_precomputed_conformers else None,
-                quantization=self.config.get('quantization', 'none'),
             )
             
-            inference_time = time.time() - inference_start
-            
-            # ═══════════════════════════════════════════════════════════
-            # STEP 6: RECORD PERFORMANCE METRICS
-            # ═══════════════════════════════════════════════════════════
-            num_molecules = len(self.unique_molecules)
-            self.optimization_manager.record_batch_processing(
-                num_molecules, inference_time
-            )
-            
-            bt.logging.info(
-                f"Boltz2 predictions complete: {num_molecules} molecules "
-                f"in {inference_time:.2f}s "
-                f"({num_molecules/inference_time:.2f} mol/s)"
-            )
-        
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                bt.logging.error(f"GPU {self.device_id} OOM error!")
-                
-                # Record OOM event
-                self.optimization_manager.record_oom_event()
-                
-                # Emergency cleanup
-                self.optimization_manager.clear_gpu_cache()
-                gc.collect()
-                
-                raise
-            else:
-                raise
-        
         except Exception as e:
-            bt.logging.error(f"Error running Boltz2: {e}")
+            bt.logging.error(f"Boltz-2 prediction failed for batch: {e}")
             bt.logging.error(traceback.format_exc())
-            return None
-        
-        # ═══════════════════════════════════════════════════════════
-        # STEP 7: POSTPROCESS
-        # ═══════════════════════════════════════════════════════════
-        postprocess_start = time.time()
-        self.postprocess_data(score_dict)
-        postprocess_time = time.time() - postprocess_start
-        bt.logging.debug(f"Postprocessing took {postprocess_time:.2f}s")
-        
-        # ═══════════════════════════════════════════════════════════
-        # STEP 8: LOG COMPREHENSIVE STATS
-        # ═══════════════════════════════════════════════════════════
-        total_time = preprocess_time + model_load_time + inference_time + postprocess_time
-        bt.logging.info(
-            f"Total pipeline time: {total_time:.2f}s "
-            f"(preprocess: {preprocess_time:.2f}s, "
-            f"model_load: {model_load_time:.2f}s, "
-            f"inference: {inference_time:.2f}s, "
-            f"postprocess: {postprocess_time:.2f}s)"
-        )
-    
+            raise
+
     # ========================================================================
     # POSTPROCESSING (same as original)
     # ========================================================================
@@ -713,6 +771,10 @@ properties:
             results_path = os.path.join(
                 self.output_dir, 'boltz_results_inputs', 'predictions', f'{mol_idx}'
             )
+            
+            if not os.path.exists(results_path):
+                bt.logging.warning(f"Results path not found for mol_idx={mol_idx}: {results_path}")
+                continue
             
             if mol_idx not in scores:
                 scores[mol_idx] = {}
@@ -728,7 +790,7 @@ properties:
                     scores[mol_idx].update(confidence_data)
         
         # Cleanup files
-        if self.config['remove_files']:
+        if self.config.get('remove_files', False):
             bt.logging.info("Removing temporary files")
             results_dir = Path(self.output_dir) / 'boltz_results_inputs'
             if results_dir.exists():
@@ -748,6 +810,19 @@ properties:
                 if uid not in final_boltz_scores:
                     final_boltz_scores[uid] = []
                 
+                # Check if we have scores for this molecule
+                if mol_idx not in scores:
+                    bt.logging.warning(f"No scores found for mol_idx={mol_idx}, uid={uid}")
+                    continue
+                
+                # Check if the metric exists
+                if self.subnet_config['boltz_metric'] not in scores[mol_idx]:
+                    bt.logging.warning(
+                        f"Metric '{self.subnet_config['boltz_metric']}' not found for mol_idx={mol_idx}. "
+                        f"Available metrics: {list(scores[mol_idx].keys())}"
+                    )
+                    continue
+                
                 metric_value = scores[mol_idx][self.subnet_config['boltz_metric']]
                 final_boltz_scores[uid].append(metric_value)
                 
@@ -758,10 +833,11 @@ properties:
         bt.logging.debug(f"final_boltz_scores: {final_boltz_scores}")
         
         for uid, data in score_dict.items():
-            if uid in final_boltz_scores:
+            if uid in final_boltz_scores and len(final_boltz_scores[uid]) > 0:
                 data['boltz_score'] = np.mean(final_boltz_scores[uid])
             else:
                 data['boltz_score'] = -math.inf
+                bt.logging.warning(f"No valid Boltz scores for UID={uid}, setting to -inf")
     
     # ========================================================================
     # UTILITY METHODS

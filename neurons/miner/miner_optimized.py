@@ -63,24 +63,47 @@ def _patch_multiprocessing_logging():
         
         while True:
             try:
+                # Check if queue is closed before attempting to read
+                if hasattr(q, '_closed') and q._closed:
+                    break
+                
                 record = self.dequeue(True)
                 if record is self._sentinel:
                     break
                 self.handle(record)
                 if has_task_done:
                     q.task_done()
-            except (EOFError, BrokenPipeError, OSError, ValueError):
-                # Worker process exited - stop monitoring silently
+            except (EOFError, BrokenPipeError, OSError, ValueError, TypeError):
+                # Worker process exited or queue closed - stop monitoring silently
                 break
-            except Exception as e:
-                # Log unexpected errors to stderr but continue
-                import traceback
-                print(f"[Logging Monitor Error] {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                continue
+            except AttributeError:
+                # Queue object no longer valid
+                break
+            except Exception:
+                # Silently ignore all other errors to prevent spam
+                break
     
     # Apply the monkey patch globally
     logging.handlers.QueueListener._monitor = safe_monitor
+    
+    # Patch QueueHandler to handle queue errors gracefully
+    original_queue_handler_emit = logging.handlers.QueueHandler.emit
+    
+    def patched_queue_handler_emit(self, record):
+        """Patched emit that handles queue errors gracefully."""
+        try:
+            # Check if queue is still valid
+            if hasattr(self.queue, '_closed') and self.queue._closed:
+                return
+            original_queue_handler_emit(self, record)
+        except (EOFError, OSError, ValueError, BrokenPipeError, TypeError, AttributeError):
+            # Silently ignore queue errors
+            pass
+        except Exception:
+            # Silently ignore all other errors
+            pass
+    
+    logging.handlers.QueueHandler.emit = patched_queue_handler_emit
     
     # Patch QueueHandler.__init__ to handle queue errors
     original_queue_handler_init = logging.handlers.QueueHandler.__init__
@@ -89,7 +112,7 @@ def _patch_multiprocessing_logging():
         """Patched QueueHandler that handles queue errors gracefully."""
         try:
             original_queue_handler_init(self, queue)
-        except (EOFError, OSError, ValueError, BrokenPipeError):
+        except (EOFError, OSError, ValueError, BrokenPipeError, TypeError, AttributeError):
             # Silently ignore queue initialization errors
             pass
     
@@ -99,9 +122,11 @@ def _patch_multiprocessing_logging():
     warnings.filterwarnings('ignore', category=ResourceWarning, module='multiprocessing')
     warnings.filterwarnings('ignore', category=RuntimeWarning, module='multiprocessing')
     warnings.filterwarnings('ignore', message='.*EOFError.*')
+    warnings.filterwarnings('ignore', message='.*TypeError.*')
     warnings.filterwarnings('ignore', message='.*multiprocessing.*')
     warnings.filterwarnings('ignore', message='.*logging.*')
     warnings.filterwarnings('ignore', message='.*semaphore_tracker.*')
+    warnings.filterwarnings('ignore', message='.*NoneType.*')
     
     # Set multiprocessing logger to CRITICAL only (effectively disabled)
     mp_logger = logging.getLogger('multiprocessing')
@@ -109,10 +134,41 @@ def _patch_multiprocessing_logging():
     mp_logger.handlers.clear()
     mp_logger.propagate = False
     
+    # Disable queue handler logging
+    queue_logger = logging.getLogger('multiprocessing.queues')
+    queue_logger.setLevel(logging.CRITICAL)
+    queue_logger.handlers.clear()
+    queue_logger.propagate = False
+    
     # Remove any QueueHandlers from root logger
     for handler in logging.root.handlers[:]:
         if isinstance(handler, logging.handlers.QueueHandler):
             logging.root.removeHandler(handler)
+    
+    # Redirect stderr to suppress C-level errors
+    import sys
+    import io
+    
+    class SilentStderr:
+        """Suppress stderr output from multiprocessing."""
+        def __init__(self):
+            self.original_stderr = sys.stderr
+            self.silent = io.StringIO()
+        
+        def write(self, text):
+            # Only suppress multiprocessing/logging errors
+            if any(keyword in text.lower() for keyword in [
+                'nonetype', 'logging', 'multiprocessing', 
+                'queue', 'semaphore', 'eoferror', 'typeerror'
+            ]):
+                return
+            self.original_stderr.write(text)
+        
+        def flush(self):
+            self.original_stderr.flush()
+    
+    # Apply stderr filter (optional - comment out if you want to see all errors)
+    # sys.stderr = SilentStderr()
 
 # Apply the patch immediately
 _patch_multiprocessing_logging()
@@ -1019,15 +1075,22 @@ async def score_molecules(
 ) -> List[float]:
     """Score molecules using EnhancedBoltzWrapper."""
     MINER_UID = 0
+    
+    # Prepare valid molecules dictionary
     valid_molecules_for_boltz = {
         MINER_UID: {'smiles': smiles, 'names': names}
     }
+    
+    # Prepare score dictionary
     score_dict = {
         MINER_UID: {'boltz_score': None, 'entropy_boltz': None}
     }
     
+    # Generate block hash for determinism
     final_block_hash = "0x" + hashlib.sha256(str(iteration).encode()).hexdigest()[:64]
-    boltz_config = {
+    
+    # ✅ FIXED: Create subnet_config (this is what EnhancedBoltzWrapper expects)
+    subnet_config = {
         'weekly_target': getattr(config, 'weekly_target', None),
         'num_antitargets': getattr(config, 'num_antitargets', 1),
         'binding_pocket': getattr(config, 'binding_pocket', None),
@@ -1038,23 +1101,25 @@ async def score_molecules(
         'sample_selection': 'first',
     }
     
-    # Run scoring in executor
+    # ✅ FIXED: Call with correct signature
     await loop.run_in_executor(
         state['boltz_executor'],
         wrapper.score_molecules_target,
-        valid_molecules_for_boltz,
-        score_dict,
-        boltz_config,
-        final_block_hash
+        valid_molecules_for_boltz,  # ✅ Correct format
+        score_dict,                  # ✅ Correct
+        final_block_hash,            # ✅ Correct
+        subnet_config                # ✅ NOW PASSING subnet_config!
     )
     
-    # Extract scores
+    # Extract scores from per-molecule metrics
     per_molecule_scores = wrapper.per_molecule_metric.get(MINER_UID, {})
     scores = []
+    
     for s in smiles:
         if s in per_molecule_scores and per_molecule_scores[s] is not None:
             scores.append(float(per_molecule_scores[s]))
         else:
+            # Fallback to average score
             avg = score_dict[MINER_UID].get('boltz_score', -math.inf)
             scores.append(float(avg) if avg != -math.inf and avg is not None else -math.inf)
     
