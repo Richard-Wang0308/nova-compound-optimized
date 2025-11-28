@@ -725,11 +725,14 @@ properties:
         # Process inputs using Boltz-2's preprocessing
         cache = Path("~/.boltz").expanduser()
         mol_dir = cache / "mols"
+
+        batch_output_dir = Path(self.output_dir) / "boltz_results_inputs"  # ✅ Convert to Path first
+        batch_output_dir.mkdir(parents=True, exist_ok=True)
         
         try:
             manifest = process_inputs(
                 data=yaml_files,
-                out_dir=Path(self.output_dir),  # Will create boltz_results_inputs inside
+                out_dir=batch_output_dir,  # Will create boltz_results_inputs inside
                 ccd_path=cache / "ccd.pkl",
                 mol_dir=mol_dir,
                 use_msa_server=False,
@@ -785,9 +788,12 @@ properties:
             callbacks=[pred_writer],
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
             devices=[self.device_id],
-            precision="32-true",
-            deterministic=True,
-            benchmark=False,
+            # precision="32-true",
+            precision="bf16-mixed",
+            # deterministic=True,
+            deterministic=False,
+            # benchmark=False,
+            benchmark=True,
         )
         
         # Run predictions

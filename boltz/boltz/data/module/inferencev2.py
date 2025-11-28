@@ -421,7 +421,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             pin_memory=True if self.num_workers == 0 else False,  # Only pin memory with 0 workers to avoid shm issues
             shuffle=False,
             collate_fn=collate,
-            persistent_workers=False,  # Disabled to avoid shared memory bus errors
+            # persistent_workers=False,  # Disabled to avoid shared memory bus errors
+            persistent_workers=True,
             prefetch_factor=2 if self.num_workers > 0 else None,  # Reduced prefetch to minimize shared memory usage
         )
 
