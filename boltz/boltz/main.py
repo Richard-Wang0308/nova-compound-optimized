@@ -885,11 +885,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Download necessary data and model
-    if model == "boltz2":
-        download_boltz2(cache)
-    else:
-        msg = f"Model {model} not supported. Supported: boltz2."
-        raise ValueError(f"Model {model} not supported.")
+    # if model == "boltz2":
+    #     download_boltz2(cache)
+    # else:
+    #     msg = f"Model {model} not supported. Supported: boltz2."
+    #     raise ValueError(f"Model {model} not supported.")
 
     # Validate inputs
     data = check_inputs(data)

@@ -269,7 +269,7 @@ class EnhancedBoltzWrapper:
         cache.mkdir(parents=True, exist_ok=True)
         
         # Download models if they don't exist
-        self._download_models_if_needed(cache)
+        # self._download_models_if_needed(cache)
         
         # ───────────────────────────────────────────────────────────
         # Load structure model using model manager
